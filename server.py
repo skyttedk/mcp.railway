@@ -39,12 +39,35 @@ def whoami() -> str:
 
 @mcp.tool()
 def list_projects() -> str:
-    """List all Railway projects."""
+    """List all Railway projects the token can access."""
+    # Try direct projects query
     data = _query("query { projects { edges { node { id name } } } }")
     projects = [e["node"] for e in data["projects"]["edges"]]
-    if not projects and DEFAULT_PROJECT:
-        return json.dumps([{"id": DEFAULT_PROJECT, "name": "(default from RAILWAY_PROJECT_ID)"}])
-    return json.dumps(projects)
+    if projects:
+        return json.dumps(projects)
+
+    # Fallback: try via workspaces
+    try:
+        me = _query("query { me { workspaces { id name } } }")
+        result = []
+        for ws in me["me"]["workspaces"]:
+            try:
+                wp = _query("""query($wid: String!) {
+                  workspace(workspaceId: $wid) { projects { edges { node { id name } } } }
+                }""", {"wid": ws["id"]})
+                for e in wp["workspace"]["projects"]["edges"]:
+                    result.append({**e["node"], "workspace": ws["name"]})
+            except Exception:
+                pass
+        if result:
+            return json.dumps(result)
+    except Exception:
+        pass
+
+    # Nothing found — tell user to set project ID
+    if DEFAULT_PROJECT:
+        return json.dumps([{"id": DEFAULT_PROJECT, "name": "(from RAILWAY_PROJECT_ID)"}])
+    return json.dumps({"error": "Token cannot list projects. Set RAILWAY_PROJECT_ID or use a less-scoped token.", "workspaces": me.get("me", {}).get("workspaces", []) if 'me' in dir() else []})
 
 @mcp.tool()
 def list_services(project_id: str = "") -> str:
