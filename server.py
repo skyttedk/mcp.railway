@@ -129,6 +129,102 @@ def deploy(project_id: str, environment_id: str, service_id: str) -> str:
     }""", {"sid": service_id})
     return json.dumps(data)
 
+
+# ── domain tools ────────────────────────────────────────────────────
+
+@mcp.tool()
+def list_service_domains(project_id: str, environment_id: str,
+                         service_id: str) -> str:
+    """List all domains (service + custom) for a Railway service."""
+    data = _query("""query($pid: String!, $eid: String!, $sid: String!) {
+      domains(projectId: $pid, environmentId: $eid, serviceId: $sid) {
+        serviceDomains { id domain targetPort syncStatus createdAt }
+        customDomains { id domain targetPort syncStatus createdAt }
+      }
+    }""", {"pid": project_id, "eid": environment_id, "sid": service_id})
+    return json.dumps(data["domains"])
+
+
+@mcp.tool()
+def create_service_domain(project_id: str, environment_id: str,
+                          service_id: str, target_port: int = 0) -> str:
+    """Create a new Railway-generated domain for a service.
+    Optionally set target_port (omit or set 0 for auto)."""
+    inp: dict = {
+        "environmentId": environment_id,
+        "serviceId": service_id,
+    }
+    if target_port and target_port > 0:
+        inp["targetPort"] = target_port
+    data = _query("""mutation($input: ServiceDomainCreateInput!) {
+      serviceDomainCreate(input: $input) {
+        domain
+        id
+        targetPort
+        syncStatus
+      }
+    }""", {"input": inp})
+    return json.dumps(data["serviceDomainCreate"])
+
+
+@mcp.tool()
+def create_custom_domain(project_id: str, environment_id: str,
+                         service_id: str, domain: str,
+                         target_port: int = 0) -> str:
+    """Add a custom domain (e.g. 'api.example.com') to a Railway service.
+    After this, Railway provides a CNAME target — set that at your DNS provider."""
+    inp: dict = {
+        "domain": domain,
+        "environmentId": environment_id,
+        "projectId": project_id,
+        "serviceId": service_id,
+    }
+    if target_port and target_port > 0:
+        inp["targetPort"] = target_port
+    data = _query("""mutation($input: CustomDomainCreateInput!) {
+      customDomainCreate(input: $input) {
+        id
+        domain
+        targetPort
+        syncStatus
+      }
+    }""", {"input": inp})
+    return json.dumps(data["customDomainCreate"])
+
+
+@mcp.tool()
+def delete_service_domain(domain_id: str) -> str:
+    """Delete a domain from a service (pass the domain ID from list_service_domains)."""
+    data = _query("""mutation($id: String!) {
+      serviceDomainDelete(id: $id)
+    }""", {"id": domain_id})
+    return json.dumps(data)
+
+
+@mcp.tool()
+def update_service_domain(environment_id: str, service_id: str,
+                          service_domain_id: str, domain: str,
+                          target_port: int = 0) -> str:
+    """Update a service domain (e.g. change target port).
+    domain must match the existing domain string."""
+    inp: dict = {
+        "domain": domain,
+        "environmentId": environment_id,
+        "serviceDomainId": service_domain_id,
+        "serviceId": service_id,
+    }
+    if target_port and target_port > 0:
+        inp["targetPort"] = target_port
+    data = _query("""mutation($input: ServiceDomainUpdateInput!) {
+      serviceDomainUpdate(input: $input) {
+        id
+        domain
+        targetPort
+        syncStatus
+      }
+    }""", {"input": inp})
+    return json.dumps(data["serviceDomainUpdate"])
+
 # ── run ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
