@@ -12,8 +12,13 @@ from mcp.server.fastmcp import FastMCP
 
 TOKEN = os.getenv("RAILWAY_API_TOKEN", "")
 API = "https://backboard.railway.com/graphql/v2"
+DEFAULT_PROJECT = os.getenv("RAILWAY_PROJECT_ID", "")
 
 mcp = FastMCP("railway")
+
+def _pid(project_id: str = "") -> str:
+    """Return project_id or default from env."""
+    return project_id or DEFAULT_PROJECT
 
 def _query(query: str, variables: dict | None = None) -> dict:
     r = requests.post(API, json={"query": query, "variables": variables or {}},
@@ -37,14 +42,19 @@ def list_projects() -> str:
     """List all Railway projects."""
     data = _query("query { projects { edges { node { id name } } } }")
     projects = [e["node"] for e in data["projects"]["edges"]]
+    if not projects and DEFAULT_PROJECT:
+        return json.dumps([{"id": DEFAULT_PROJECT, "name": "(default from RAILWAY_PROJECT_ID)"}])
     return json.dumps(projects)
 
 @mcp.tool()
-def list_services(project_id: str) -> str:
-    """List services in a Railway project."""
+def list_services(project_id: str = "") -> str:
+    """List services in a Railway project (uses RAILWAY_PROJECT_ID if empty)."""
+    pid = _pid(project_id)
+    if not pid:
+        return json.dumps({"error": "No project_id provided and RAILWAY_PROJECT_ID not set"})
     data = _query("""query($id: String!) {
       project(id: $id) { services { edges { node { id name } } } }
-    }""", {"id": project_id})
+    }""", {"id": pid})
     services = [e["node"] for e in data["project"]["services"]["edges"]]
     return json.dumps(services)
 
