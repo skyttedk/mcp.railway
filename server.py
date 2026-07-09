@@ -135,14 +135,96 @@ def deploy(project_id: str, environment_id: str, service_id: str) -> str:
 @mcp.tool()
 def list_service_domains(project_id: str, environment_id: str,
                          service_id: str) -> str:
-    """List all domains (service + custom) for a Railway service."""
+    """List all domains (service + custom) for a Railway service.
+
+    For custom domains, includes DNS verification info (TXT host/token),
+    verification status, DNS records (CNAME target etc.), and SSL cert status.
+    """
     data = _query("""query($pid: String!, $eid: String!, $sid: String!) {
       domains(projectId: $pid, environmentId: $eid, serviceId: $sid) {
         serviceDomains { id domain targetPort syncStatus createdAt }
-        customDomains { id domain targetPort syncStatus createdAt }
+        customDomains {
+          id
+          domain
+          targetPort
+          syncStatus
+          createdAt
+          status {
+            verified
+            verificationDnsHost
+            verificationToken
+            certificateStatus
+            certificateErrorType
+            certificateErrorMessage
+            certificateStatusDetailed
+            cdnProvider
+            dnsRecords {
+              hostlabel
+              fqdn
+              recordType
+              requiredValue
+              currentValue
+              status
+              zone
+              purpose
+            }
+          }
+        }
       }
     }""", {"pid": project_id, "eid": environment_id, "sid": service_id})
     return json.dumps(data["domains"])
+
+
+@mcp.tool()
+def get_custom_domain_details(project_id: str, environment_id: str,
+                              service_id: str, domain: str) -> str:
+    """Get full DNS details for a specific custom domain, including
+    verification TXT records, CNAME targets, and SSL certificate status.
+
+    Use this after create_custom_domain to get the verification values
+    you need to set at your DNS provider (e.g. Simply.com).
+    """
+    data = _query("""query($pid: String!, $eid: String!, $sid: String!) {
+      domains(projectId: $pid, environmentId: $eid, serviceId: $sid) {
+        customDomains {
+          id
+          domain
+          targetPort
+          syncStatus
+          status {
+            verified
+            verificationDnsHost
+            verificationToken
+            certificateStatus
+            certificateErrorType
+            certificateErrorMessage
+            certificateStatusDetailed
+            cdnProvider
+            dnsRecords {
+              hostlabel
+              fqdn
+              recordType
+              requiredValue
+              currentValue
+              status
+              zone
+              purpose
+            }
+          }
+        }
+      }
+    }""", {"pid": project_id, "eid": environment_id, "sid": service_id})
+
+    # Filter to the requested domain
+    domains = data.get("domains", {}).get("customDomains", [])
+    target = [d for d in domains if d["domain"] == domain]
+    if not target:
+        # Try case-insensitive match
+        target = [d for d in domains if d["domain"].lower() == domain.lower()]
+    if not target:
+        return json.dumps({"error": f"Custom domain '{domain}' not found on this service",
+                           "available_domains": [d["domain"] for d in domains]})
+    return json.dumps(target[0])
 
 
 @mcp.tool()
