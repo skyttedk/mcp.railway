@@ -1,0 +1,4 @@
+{
+  "build": { "builder": "DOCKERFILE" },
+  "deploy": { "startCommand": "python server.py" }
+}
