@@ -82,6 +82,35 @@ def list_services(project_id: str = "") -> str:
     return json.dumps(services)
 
 @mcp.tool()
+def create_service(project_id: str, environment_id: str, name: str) -> str:
+    """Create a new Railway service inside a project/environment."""
+    data = _query("""mutation($input: ServiceCreateInput!) {
+      serviceCreate(input: $input) {
+        id
+        name
+      }
+    }""", {"input": {
+        "projectId": project_id,
+        "environmentId": environment_id,
+        "name": name,
+    }})
+    return json.dumps(data["serviceCreate"])
+
+@mcp.tool()
+def connect_service(service_id: str, repo: str, branch: str = "master") -> str:
+    """Connect a Railway service to a GitHub repo/branch for auto deploys."""
+    data = _query("""mutation($id: String!, $input: ServiceConnectInput!) {
+      serviceConnect(id: $id, input: $input) {
+        id
+        name
+      }
+    }""", {"id": service_id, "input": {
+        "repo": repo,
+        "branch": branch,
+    }})
+    return json.dumps(data["serviceConnect"])
+
+@mcp.tool()
 def list_environments(project_id: str) -> str:
     """List environments in a Railway project."""
     data = _query("""query($id: String!) {
