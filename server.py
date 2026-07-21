@@ -128,6 +128,32 @@ def list_variables(project_id: str, environment_id: str, service_id: str = "") -
     return json.dumps(data["variables"])
 
 @mcp.tool()
+def check_variable(project_id: str, environment_id: str,
+                   service_id: str, key: str) -> str:
+    """Check whether a single env var is configured on a Railway service.
+
+    Returns {key, exists, length, sha256_16}. The value is not included, which
+    keeps the response safe to log or share. sha256_16 is the first 16 hex
+    chars of sha256(value): compare it against a locally computed hash to
+    confirm a specific expected value without moving the value itself. Use when
+    you only need to verify a key is set, rather than reading all variables."""
+    import hashlib
+    data = _query("""query($pid: String!, $eid: String!, $sid: String!) {
+      variables(projectId: $pid, environmentId: $eid, serviceId: $sid)
+    }""", {"pid": project_id, "eid": environment_id, "sid": service_id})
+    variables = data["variables"] or {}
+    value = variables.get(key)
+    if value is None:
+        return json.dumps({"key": key, "exists": False})
+    v = str(value)
+    return json.dumps({
+        "key": key,
+        "exists": True,
+        "length": len(v),
+        "sha256_16": hashlib.sha256(v.encode()).hexdigest()[:16],
+    })
+
+@mcp.tool()
 def set_variables(project_id: str, environment_id: str,
                   service_id: str, variables: dict[str, str]) -> str:
     """Set variables on a Railway service."""
@@ -142,13 +168,31 @@ def set_variables(project_id: str, environment_id: str,
 @mcp.tool()
 def get_logs(project_id: str, environment_id: str, service_id: str,
              limit: int = 50) -> str:
-    """Get recent deployment logs for a service."""
-    data = _query("""query($pid: String!, $eid: String!, $sid: String!, $limit: Int!) {
-      deploymentLogs(projectId: $pid, environmentId: $eid, serviceId: $sid, limit: $limit) {
+    """Get recent deployment logs for a service.
+
+    Railway's API has no deploymentLogs(projectId/environmentId/serviceId) query —
+    logs are keyed by deploymentId. This looks up the most recent deployment for
+    the given project/environment/service, then fetches that deployment's logs.
+    """
+    deployments = _query("""query($input: DeploymentListInput!) {
+      deployments(input: $input, first: 5) {
+        edges { node { id createdAt status } }
+      }
+    }""", {"input": {
+        "projectId": project_id, "environmentId": environment_id, "serviceId": service_id
+    }})
+    edges = deployments.get("deployments", {}).get("edges", [])
+    if not edges:
+        return json.dumps({"error": "No deployments found for this project/environment/service"})
+    latest = sorted((e["node"] for e in edges), key=lambda d: d["createdAt"], reverse=True)[0]
+
+    data = _query("""query($did: String!, $limit: Int!) {
+      deploymentLogs(deploymentId: $did, limit: $limit) {
         timestamp message
       }
-    }""", {"pid": project_id, "eid": environment_id, "sid": service_id, "limit": limit})
-    return json.dumps(data.get("deploymentLogs", []))
+    }""", {"did": latest["id"], "limit": limit})
+    return json.dumps({"deploymentId": latest["id"], "deploymentStatus": latest["status"],
+                       "logs": data.get("deploymentLogs", [])})
 
 @mcp.tool()
 def deploy(project_id: str, environment_id: str, service_id: str) -> str:
