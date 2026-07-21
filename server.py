@@ -195,6 +195,39 @@ def get_logs(project_id: str, environment_id: str, service_id: str,
                        "logs": data.get("deploymentLogs", [])})
 
 @mcp.tool()
+def get_metrics(project_id: str, environment_id: str, service_id: str,
+                start_date: str, end_date: str = "",
+                measurements: list[str] | None = None,
+                sample_rate_seconds: int = 0) -> str:
+    """Get CPU/memory/network/disk usage samples for a service over a time range.
+
+    start_date/end_date are ISO 8601 timestamps (e.g. "2026-07-21T12:08:00Z");
+    end_date defaults to now. measurements is a subset of: CPU_USAGE, CPU_USAGE_2,
+    CPU_LIMIT, MEMORY_USAGE_GB, MEMORY_LIMIT_GB, NETWORK_TX_GB, NETWORK_RX_GB,
+    DISK_USAGE_GB, EPHEMERAL_DISK_USAGE_GB, BACKUP_USAGE_GB — defaults to
+    CPU_USAGE and MEMORY_USAGE_GB if omitted. Results are grouped by deployment,
+    so each sample series carries its deploymentId tag — use that to isolate one
+    deployment's window when others ran in the same project/environment/service
+    during the requested range. Each value is {ts, value} (ts = unix seconds).
+    """
+    data = _query("""query($pid: String!, $eid: String!, $sid: String!, $start: DateTime!,
+                          $end: DateTime, $measurements: [MetricMeasurement!]!, $rate: Int) {
+      metrics(projectId: $pid, environmentId: $eid, serviceId: $sid,
+              startDate: $start, endDate: $end, measurements: $measurements,
+              sampleRateSeconds: $rate, groupBy: [DEPLOYMENT_ID]) {
+        measurement
+        tags { deploymentId }
+        values { ts value }
+      }
+    }""", {
+        "pid": project_id, "eid": environment_id, "sid": service_id,
+        "start": start_date, "end": end_date or None,
+        "measurements": measurements or ["CPU_USAGE", "MEMORY_USAGE_GB"],
+        "rate": sample_rate_seconds or None,
+    })
+    return json.dumps(data.get("metrics", []))
+
+@mcp.tool()
 def deploy(project_id: str, environment_id: str, service_id: str) -> str:
     """Trigger a deploy for a service (via restart)."""
     data = _query("""mutation($sid: String!) {
