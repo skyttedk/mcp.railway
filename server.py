@@ -70,6 +70,33 @@ def list_projects() -> str:
     return json.dumps({"error": "Token cannot list projects. Set RAILWAY_PROJECT_ID or use a less-scoped token.", "workspaces": me.get("me", {}).get("workspaces", []) if 'me' in dir() else []})
 
 @mcp.tool()
+def create_project(name: str, description: str = "", team_id: str = "") -> str:
+    """Create a new Railway project.
+
+    name is required. description is optional. team_id (a workspace/team id from
+    whoami's workspaces) targets a shared workspace; omit it to create the project
+    in the token owner's personal workspace. Railway auto-creates a "production"
+    environment — this returns the new project's id plus its environments
+    (id + name), so the returned environment id can be passed straight to
+    create_service without a separate list_environments call.
+    """
+    inp: dict = {"name": name}
+    if description:
+        inp["description"] = description
+    if team_id:
+        inp["teamId"] = team_id
+    data = _query("""mutation($input: ProjectCreateInput!) {
+      projectCreate(input: $input) {
+        id
+        name
+        environments { edges { node { id name } } }
+      }
+    }""", {"input": inp})
+    proj = data["projectCreate"]
+    proj["environments"] = [e["node"] for e in proj["environments"]["edges"]]
+    return json.dumps(proj)
+
+@mcp.tool()
 def list_services(project_id: str = "") -> str:
     """List services in a Railway project (uses RAILWAY_PROJECT_ID if empty)."""
     pid = _pid(project_id)
