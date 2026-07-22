@@ -33,8 +33,13 @@ def _query(query: str, variables: dict | None = None) -> dict:
 
 @mcp.tool()
 def whoami() -> str:
-    """Return authenticated Railway user email."""
-    data = _query("query { me { email } }")
+    """Return the authenticated Railway user plus the workspaces the token can
+    create projects in.
+
+    Each workspace is {id, name}; pass a workspace id to create_project's
+    workspace_id (Railway's ProjectCreateInput requires a workspaceId — there is
+    no implicit "personal" default at the API level)."""
+    data = _query("query { me { email name workspaces { id name } } }")
     return json.dumps(data["me"])
 
 @mcp.tool()
@@ -70,21 +75,31 @@ def list_projects() -> str:
     return json.dumps({"error": "Token cannot list projects. Set RAILWAY_PROJECT_ID or use a less-scoped token.", "workspaces": me.get("me", {}).get("workspaces", []) if 'me' in dir() else []})
 
 @mcp.tool()
-def create_project(name: str, description: str = "", team_id: str = "") -> str:
+def create_project(name: str, description: str = "", workspace_id: str = "") -> str:
     """Create a new Railway project.
 
-    name is required. description is optional. team_id (a workspace/team id from
-    whoami's workspaces) targets a shared workspace; omit it to create the project
-    in the token owner's personal workspace. Railway auto-creates a "production"
+    name is required. description is optional. workspace_id is the target
+    workspace (from whoami's `workspaces`); Railway's ProjectCreateInput requires
+    a workspaceId, so if workspace_id is omitted this auto-selects the workspace
+    when the token owns exactly one, and otherwise returns an error listing the
+    available workspaces to choose from. Railway auto-creates a "production"
     environment — this returns the new project's id plus its environments
     (id + name), so the returned environment id can be passed straight to
     create_service without a separate list_environments call.
     """
-    inp: dict = {"name": name}
+    wid = workspace_id
+    if not wid:
+        workspaces = _query("query { me { workspaces { id name } } }")["me"]["workspaces"]
+        if len(workspaces) == 1:
+            wid = workspaces[0]["id"]
+        elif not workspaces:
+            return json.dumps({"error": "Token has no workspaces; cannot create a project."})
+        else:
+            return json.dumps({"error": "Multiple workspaces — pass workspace_id.",
+                               "workspaces": workspaces})
+    inp: dict = {"name": name, "workspaceId": wid}
     if description:
         inp["description"] = description
-    if team_id:
-        inp["teamId"] = team_id
     data = _query("""mutation($input: ProjectCreateInput!) {
       projectCreate(input: $input) {
         id
