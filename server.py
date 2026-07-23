@@ -455,6 +455,111 @@ def update_service_domain(environment_id: str, service_id: str,
     }""", {"input": inp})
     return json.dumps(data["serviceDomainUpdate"])
 
+
+@mcp.tool()
+def list_volumes(project_id: str = "") -> str:
+    """List persistent volumes in a project (uses RAILWAY_PROJECT_ID if empty).
+
+    A volume is project-scoped; its per-environment attachments are the
+    `instances`, each carrying the mount path, size and the service it is
+    attached to. Use an instance's `id` for volume backups and the parent
+    volume's `id` for delete_volume/update_volume_mount."""
+    pid = _pid(project_id)
+    if not pid:
+        return json.dumps({"error": "No project_id provided and RAILWAY_PROJECT_ID not set"})
+    data = _query("""query($id: String!) {
+      project(id: $id) { volumes { edges { node {
+        id
+        name
+        createdAt
+        volumeInstances { edges { node {
+          id
+          mountPath
+          sizeMB
+          currentSizeMB
+          region
+          state
+          serviceId
+          environmentId
+          service { id name }
+        } } }
+      } } } }
+    }""", {"id": pid})
+    volumes = []
+    for edge in data["project"]["volumes"]["edges"]:
+        vol = edge["node"]
+        vol["instances"] = [e["node"] for e in vol.pop("volumeInstances")["edges"]]
+        volumes.append(vol)
+    return json.dumps(volumes)
+
+
+@mcp.tool()
+def create_volume(project_id: str, environment_id: str, service_id: str,
+                  mount_path: str, region: str = "") -> str:
+    """Create a persistent volume and attach it to a service at mount_path.
+
+    mount_path is the absolute path inside the container (e.g. "/data"); Railway
+    rejects paths that collide with the image's own directories. region is
+    optional and defaults to the service's region. Railway sizes the volume by
+    plan (no size argument) and the service must redeploy before the mount is
+    live — call deploy() afterwards."""
+    inp: dict = {
+        "projectId": project_id,
+        "environmentId": environment_id,
+        "serviceId": service_id,
+        "mountPath": mount_path,
+    }
+    if region:
+        inp["region"] = region
+    data = _query("""mutation($input: VolumeCreateInput!) {
+      volumeCreate(input: $input) {
+        id
+        name
+        createdAt
+      }
+    }""", {"input": inp})
+    return json.dumps(data["volumeCreate"])
+
+
+@mcp.tool()
+def update_volume_mount(volume_id: str, environment_id: str = "",
+                        mount_path: str = "", service_id: str = "") -> str:
+    """Re-mount an existing volume: change its mount path and/or move it to a
+    different service, for one environment.
+
+    volume_id is the parent volume (from list_volumes), not the instance id.
+    environment_id selects which instance to update; omit it only for
+    single-environment projects. Pass at least one of mount_path / service_id.
+    Requires a redeploy of the affected service to take effect."""
+    inp: dict = {}
+    if mount_path:
+        inp["mountPath"] = mount_path
+    if service_id:
+        inp["serviceId"] = service_id
+    if not inp:
+        return json.dumps({"error": "Pass at least one of mount_path / service_id."})
+    variables: dict = {"volumeId": volume_id, "input": inp}
+    if environment_id:
+        variables["environmentId"] = environment_id
+    data = _query("""mutation($volumeId: String!, $environmentId: String,
+                             $input: VolumeInstanceUpdateInput!) {
+      volumeInstanceUpdate(volumeId: $volumeId, environmentId: $environmentId,
+                           input: $input)
+    }""", variables)
+    return json.dumps(data)
+
+
+@mcp.tool()
+def delete_volume(volume_id: str) -> str:
+    """Delete a volume and permanently destroy its data.
+
+    volume_id is the parent volume id from list_volumes. This removes the volume
+    in every environment it is attached to and cannot be undone."""
+    data = _query("""mutation($volumeId: String!) {
+      volumeDelete(volumeId: $volumeId)
+    }""", {"volumeId": volume_id})
+    return json.dumps(data)
+
 # ── run ─────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
