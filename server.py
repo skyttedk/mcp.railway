@@ -205,6 +205,31 @@ def set_region(environment_id: str, service_id: str, region: str,
     return json.dumps(result)
 
 @mcp.tool()
+def set_start_command(environment_id: str, service_id: str, start_command: str,
+                      redeploy: bool = False) -> str:
+    """Set or clear the custom start command for a service in one environment.
+
+    Pass an empty string to clear the override so the service falls back to
+    its Dockerfile CMD / builder default. The change only takes effect on the
+    next deploy — pass redeploy=true to trigger one immediately."""
+    _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
+      serviceInstanceUpdate(serviceId: $sid, environmentId: $eid, input: $input)
+    }""", {"sid": service_id, "eid": environment_id,
+           "input": {"startCommand": start_command or None}})
+    result: dict = {"serviceId": service_id, "environmentId": environment_id,
+                    "startCommand": start_command or None, "updated": True,
+                    "redeployed": False}
+    if redeploy:
+        _query("""mutation($sid: String!, $eid: String!) {
+          serviceInstanceRedeploy(serviceId: $sid, environmentId: $eid)
+        }""", {"sid": service_id, "eid": environment_id})
+        result["redeployed"] = True
+    else:
+        result["note"] = "Start-command change takes effect on the next deploy."
+    return json.dumps(result)
+
+
+@mcp.tool()
 def create_service(project_id: str, environment_id: str, name: str) -> str:
     """Create a new Railway service inside a project/environment."""
     data = _query("""mutation($input: ServiceCreateInput!) {
