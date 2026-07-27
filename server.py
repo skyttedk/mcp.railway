@@ -113,15 +113,94 @@ def create_project(name: str, description: str = "", workspace_id: str = "") -> 
 
 @mcp.tool()
 def list_services(project_id: str = "") -> str:
-    """List services in a Railway project (uses RAILWAY_PROJECT_ID if empty)."""
+    """List services in a Railway project (uses RAILWAY_PROJECT_ID if empty).
+
+    Each service includes its per-environment `instances` with the region
+    override; region null means the service runs in Railway's default region
+    (no per-service override) — use get_service_instance / list_regions for
+    details."""
     pid = _pid(project_id)
     if not pid:
         return json.dumps({"error": "No project_id provided and RAILWAY_PROJECT_ID not set"})
     data = _query("""query($id: String!) {
-      project(id: $id) { services { edges { node { id name } } } }
+      project(id: $id) { services { edges { node {
+        id
+        name
+        serviceInstances { edges { node { environmentId region numReplicas } } }
+      } } } }
     }""", {"id": pid})
-    services = [e["node"] for e in data["project"]["services"]["edges"]]
+    services = []
+    for e in data["project"]["services"]["edges"]:
+        svc = e["node"]
+        svc["instances"] = [i["node"] for i in svc.pop("serviceInstances")["edges"]]
+        services.append(svc)
     return json.dumps(services)
+
+
+@mcp.tool()
+def list_regions() -> str:
+    """List the deploy regions available to this Railway account.
+
+    Returns [{id, name, location, country, region}]. Pass a region id to
+    set_region or create_volume."""
+    data = _query("query { regions { id name location country region } }")
+    return json.dumps(data["regions"])
+
+
+@mcp.tool()
+def get_service_instance(environment_id: str, service_id: str) -> str:
+    """Get one service's per-environment deploy config: region, replicas,
+    builder, commands, healthcheck, sleep/cron settings.
+
+    `region` is the per-service override; null means the service inherits
+    Railway's default region (currently US West / us-west2 for new services —
+    confirm with list_regions). Change it with set_region."""
+    data = _query("""query($sid: String!, $eid: String!) {
+      serviceInstance(serviceId: $sid, environmentId: $eid) {
+        serviceId
+        serviceName
+        environmentId
+        region
+        numReplicas
+        builder
+        buildCommand
+        startCommand
+        preDeployCommand
+        rootDirectory
+        healthcheckPath
+        healthcheckTimeout
+        sleepApplication
+        cronSchedule
+        restartPolicyType
+        restartPolicyMaxRetries
+      }
+    }""", {"sid": service_id, "eid": environment_id})
+    return json.dumps(data["serviceInstance"])
+
+
+@mcp.tool()
+def set_region(environment_id: str, service_id: str, region: str,
+               redeploy: bool = False) -> str:
+    """Set the deploy region for a service in one environment.
+
+    region is a region id from list_regions (e.g. "europe-west4-drams3a").
+    The change only takes effect on the next deploy — pass redeploy=true to
+    trigger one immediately. NB: attached volumes do NOT move with the
+    service; a volume stays in its own region, so check list_volumes before
+    moving a service with persistent storage."""
+    _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
+      serviceInstanceUpdate(serviceId: $sid, environmentId: $eid, input: $input)
+    }""", {"sid": service_id, "eid": environment_id, "input": {"region": region}})
+    result: dict = {"serviceId": service_id, "environmentId": environment_id,
+                    "region": region, "updated": True, "redeployed": False}
+    if redeploy:
+        _query("""mutation($sid: String!, $eid: String!) {
+          serviceInstanceRedeploy(serviceId: $sid, environmentId: $eid)
+        }""", {"sid": service_id, "eid": environment_id})
+        result["redeployed"] = True
+    else:
+        result["note"] = "Region change takes effect on the next deploy."
+    return json.dumps(result)
 
 @mcp.tool()
 def create_service(project_id: str, environment_id: str, name: str) -> str:
