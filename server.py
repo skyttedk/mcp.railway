@@ -141,8 +141,9 @@ def list_services(project_id: str = "") -> str:
 def list_regions() -> str:
     """List the deploy regions available to this Railway account.
 
-    Returns [{id, name, location, country, region}]. Pass a region id to
-    set_region or create_volume."""
+    Returns [{id, name, location, country, region}]. Pass the `name` value
+    (e.g. "europe-west4-drams3a", "us-west2") to set_region or create_volume —
+    NOT the short `id` ("ams", "sfo"), which is just the metro code."""
     data = _query("query { regions { id name location country region } }")
     return json.dumps(data["regions"])
 
@@ -183,7 +184,8 @@ def set_region(environment_id: str, service_id: str, region: str,
                redeploy: bool = False) -> str:
     """Set the deploy region for a service in one environment.
 
-    region is a region id from list_regions (e.g. "europe-west4-drams3a").
+    region is a region `name` from list_regions (e.g. "europe-west4-drams3a"),
+    not the short metro `id`.
     The change only takes effect on the next deploy — pass redeploy=true to
     trigger one immediately. NB: attached volumes do NOT move with the
     service; a volume stays in its own region, so check list_volumes before
