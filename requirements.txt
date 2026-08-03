@@ -1,3 +1,6 @@
-mcp>=1.2.0
+# Pinned below 2.0: the mcp 2.x SDK removed mcp.server.fastmcp, which server.py
+# imports. An unpinned >=1.2.0 resolves to 2.0.0 and crash-loops the service on
+# ModuleNotFoundError at import time. Moving to 2.x is a code change.
+mcp>=1.2.0,<2
 requests>=2.28.0
 python-dotenv>=1.0.0
