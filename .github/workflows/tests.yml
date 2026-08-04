@@ -1,0 +1,43 @@
+name: tests
+
+# Two live Railway services deploy from this repository, so every push and
+# every pull request runs the suite. It is stdlib unittest, needs no Railway
+# credentials, and finishes in well under a second.
+on: [push, pull_request]
+
+# Read-only: the job has no business writing anything, and nothing here needs
+# a token.
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Matches the Dockerfile the services are built from.
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # The suite is worth having precisely because it needs no credentials:
+      # it fakes the HTTP boundary and never contacts the Railway API. If a
+      # token ever leaks into this job, a test could start passing for the
+      # wrong reason, so fail loudly instead. Only names are printed, never
+      # values.
+      - name: Assert the job has no Railway credentials
+        run: |
+          for name in RAILWAY_API_TOKEN RAILWAY_PROJECT_ID MCP_AUTH_TOKEN; do
+            if [ -n "${!name:-}" ]; then
+              echo "::error::$name is set in this job; the suite must run without credentials"
+              exit 1
+            fi
+          done
+          echo "No Railway credentials in the environment, as intended."
+
+      - name: Run tests
+        run: python -m unittest discover -s tests -v

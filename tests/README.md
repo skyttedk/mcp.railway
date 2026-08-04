@@ -9,6 +9,11 @@ Railway credentials needed. The suite never contacts the Railway API: it swaps
 `server._session` for a fake at the HTTP boundary, and refuses any call that
 forgets to. It runs in well under a second.
 
+GitHub Actions runs exactly that command on every push and every pull request
+(`.github/workflows/tests.yml`), so the suite protects a change whether or not
+anyone remembers to run it. The workflow also fails if a Railway credential is
+present in the job, because the suite is only trustworthy while it has none.
+
 It is deliberately small, and meant to stay that way. It does not chase
 coverage; it locks the two properties that would have caught the last two real
 defects:
