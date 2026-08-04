@@ -663,7 +663,18 @@ _RESTARTABLE_STATUSES = ("SUCCESS", "SLEEPING", "CRASHED")
 
 @mcp.tool()
 async def deploy(project_id: str, environment_id: str, service_id: str) -> str:
-    """Trigger a deploy for a service (via restart of its current deployment).
+    """RESTART the deployment a service is already running. It does NOT build,
+    and it does NOT pick up new code.
+
+    Despite the name, nothing is deployed: the container is torn down and
+    started again from the SAME image that is running now. A service left
+    running old code is still running old code afterwards. Use it to clear a
+    wedged process, re-read a changed environment variable, or bring a crashed
+    container back.
+
+    To make new code go live, use create_deployment — that one builds the
+    service's current source and releases a NEW deployment. This tool keeps its
+    misleading name only because callers already use it.
 
     Railway's deploymentRestart takes a DEPLOYMENT id, not a service id — a
     service id passed to it is simply an id that matches no deployment, and the
@@ -700,6 +711,95 @@ async def deploy(project_id: str, environment_id: str, service_id: str) -> str:
     return json.dumps({"deploymentId": target["id"],
                        "deploymentStatus": target["status"],
                        "restarted": data.get("deploymentRestart")})
+
+
+@mcp.tool()
+async def create_deployment(environment_id: str = "", service_id: str = "",
+                      commit_sha: str = "") -> str:
+    """DEPLOY FOR REAL: build the service's current source and release the
+    result as a NEW deployment. This is the tool that makes new code go live.
+
+    DISRUPTIVE. The service is rebuilt and its running container is replaced,
+    so a live service is interrupted for the length of the build and the
+    changeover, and a broken commit reaches production the moment it builds.
+    There is no dry run. If the goal is merely to restart a wedged process or
+    re-read a variable, deploy() is the cheaper and safer call — it restarts
+    what is already running and never rebuilds.
+
+    Railway's serviceInstanceDeployV2 addresses the SERVICE and ENVIRONMENT
+    directly and returns the id of the deployment it created. It is a different
+    mutation from deploymentRestart, which deploy() uses and which needs a
+    DEPLOYMENT id. By default it deploys the commit currently associated with
+    the service; pass commit_sha to deploy a specific one — for example the
+    HEAD of the connected GitHub branch, because a plain call does NOT go and
+    look for newer commits. Railway validates the sha against the connected
+    repo and creates no deployment for one it does not recognise.
+
+    ONE service per call, identified explicitly. Both ids are required and are
+    never guessed: an omitted id, or an id that reads as a list or a pattern,
+    is refused before anything is built.
+    """
+    missing = [n for n, v in (("environment_id", environment_id),
+                              ("service_id", service_id)) if not v.strip()]
+    if missing:
+        return json.dumps({
+            "error": f"Cannot deploy: {' and '.join(missing)} not given. "
+                     "create_deployment never chooses a service or an "
+                     "environment for you — service ids come from "
+                     "list_services, environment ids from list_environments. "
+                     "Nothing was built."})
+
+    # Same guard, and the same constant, as delete_service (defined below): an
+    # id carrying a wildcard or a separator means the caller had a SET of
+    # services in mind. Deploying several at once is not offered, and guessing
+    # which one was meant would rebuild production on a hunch.
+    set_like = [c for c in _SET_LIKE_NAME_CHARS if c in service_id]
+    if set_like:
+        return json.dumps({
+            "error": f"Refusing service_id {service_id!r}: it contains "
+                     f"{''.join(set_like)!r} and so reads as a pattern or a "
+                     "list of ids, not one service. create_deployment deploys "
+                     "exactly one service per call. Nothing was built — deploy "
+                     "them one at a time, each named in its own call."})
+
+    variables = {"sid": service_id.strip(), "eid": environment_id.strip()}
+    if commit_sha.strip():
+        variables["sha"] = commit_sha.strip()
+        mutation = """mutation($sid: String!, $eid: String!, $sha: String!) {
+          serviceInstanceDeployV2(serviceId: $sid, environmentId: $eid, commitSha: $sha)
+        }"""
+    else:
+        mutation = """mutation($sid: String!, $eid: String!) {
+          serviceInstanceDeployV2(serviceId: $sid, environmentId: $eid)
+        }"""
+
+    try:
+        data = await _query(mutation, variables)
+    except RuntimeError as exc:
+        # Railway reports a wrong id, a mismatched pair and an unknown commit
+        # through the same generic channel, so say which of the three was
+        # actually being attempted rather than passing the message through.
+        result = {
+            "error": f"Railway refused to deploy service {service_id} in "
+                     f"environment {environment_id}: {exc}",
+            "hint": "Both ids must belong to the same project — a mismatched "
+                    "pair is reported exactly like a missing service, so check "
+                    "the pair before concluding the service is gone. Nothing "
+                    "was built.",
+        }
+        if commit_sha.strip():
+            result["hint"] += (f" A commit_sha ({commit_sha}) Railway cannot "
+                               "find in the connected repo fails the same way.")
+        return json.dumps(result)
+
+    return json.dumps({
+        "serviceId": service_id.strip(),
+        "environmentId": environment_id.strip(),
+        "commitSha": commit_sha.strip() or None,
+        "deploymentId": data.get("serviceInstanceDeployV2"),
+        "note": "A NEW deployment was created and is building now; the running "
+                "container is replaced when it succeeds. Follow it with "
+                "get_logs, and list_services for its status."})
 
 
 # A deployment can only be stopped while it still has a container. Same set as

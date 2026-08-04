@@ -39,6 +39,14 @@
       "target_port": "integer"
     }
   },
+  "create_deployment": {
+    "required": [],
+    "args": {
+      "commit_sha": "string",
+      "environment_id": "string",
+      "service_id": "string"
+    }
+  },
   "create_project": {
     "required": [
       "name"

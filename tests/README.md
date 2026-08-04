@@ -49,6 +49,19 @@ confirm must each leave the account untouched and say which service was meant.
 The happy path is held to deleting exactly one service and naming it, so a
 transcript records what was destroyed.
 
+And one class for deploying for real (`CreateDeploymentTest`), because the two
+neighbouring tools are easy to confuse and the confusion is silent: `deploy`
+restarts the container already running and builds nothing, so an agent that
+reaches for it sees a success and reports that new code is live. The tests hold
+`create_deployment` to the other Railway mutation entirely
+(`serviceInstanceDeployV2`, which takes the SERVICE and returns the id of the
+deployment it created — never `deploymentRestart`), to passing a `commit_sha`
+through when one is named, and to refusing a missing id or one that reads as a
+list or a pattern without building anything. Two more guard the pair rather
+than either tool: `deploy`'s answer must stay byte-for-byte what it was, and
+each description must keep the words that let a reader of the tool list alone
+pick the right one.
+
 And one class for the size of a `get_metrics` answer (`MetricsSizeTest`),
 because that failure is invisible from inside this repo: it costs the calling
 agent's context window rather than anything Railway or the server measures, and
