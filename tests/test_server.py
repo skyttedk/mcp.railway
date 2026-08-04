@@ -319,6 +319,159 @@ class RegressionTest(_StubbedServer):
                          "restarted anyway despite having no restartable deployment")
 
 
+# ── deploying for real, next to a tool that only restarts ───────────
+
+class CreateDeploymentTest(_StubbedServer):
+    """`deploy` restarts the container already running; it builds nothing. The
+    failure guarded here is silent and one level up from the code: an agent
+    reads the name, calls it, sees it succeed and reports that new code is
+    live. `create_deployment` is the tool that actually builds and releases,
+    so the two must reach DIFFERENT Railway mutations and must be readable
+    apart from their descriptions alone.
+
+    The mutation is `serviceInstanceDeployV2(serviceId, environmentId,
+    commitSha)`, which addresses the SERVICE directly and returns the id of the
+    deployment it created — not `deploymentRestart`, which needs a DEPLOYMENT
+    id and is the trap `deploy` already carries a regression test for.
+    """
+
+    _DEPLOYS = {"serviceInstanceDeployV2": {"serviceInstanceDeployV2": "dep-new"}}
+
+    async def test_it_builds_a_new_deployment_for_the_service(self):
+        session = self.install(self._DEPLOYS)
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "create_deployment", {"environment_id": "e1", "service_id": "svc1"})))
+
+        self.assertNotIn("error", result)
+        self.assertEqual("dep-new", result["deploymentId"],
+                         "the id Railway returned for the new deployment was lost")
+        call = next(c for c in session.calls
+                    if "serviceInstanceDeployV2" in c["query"])
+        self.assertEqual({"sid": "svc1", "eid": "e1"}, call["variables"],
+                         "the service and environment ids were not the ones sent")
+
+    async def test_it_does_not_go_through_the_restart_mutation(self):
+        """The whole point of the tool. If it restarted like `deploy`, it would
+        report success without building anything — the same wrong mental model
+        one name further along."""
+        session = self.install(self._DEPLOYS)
+
+        await server.mcp.call_tool(
+            "create_deployment", {"environment_id": "e1", "service_id": "svc1"})
+
+        self.assertFalse([c for c in session.calls if "deploymentRestart" in c["query"]],
+                         "create_deployment restarted instead of deploying")
+        self.assertFalse([c for c in session.calls if "deployments(input:" in c["query"]],
+                         "resolved a deployment id — serviceInstanceDeployV2 "
+                         "takes the SERVICE, so that lookup is the old trap "
+                         "being repeated in reverse")
+
+    async def test_a_commit_sha_is_passed_through_when_given(self):
+        """A plain call deploys the commit already associated with the service
+        and does NOT look for newer ones, so deploying the HEAD of a branch
+        means naming it."""
+        session = self.install(self._DEPLOYS)
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "create_deployment", {"environment_id": "e1", "service_id": "svc1",
+                                  "commit_sha": "abc123"})))
+
+        call = next(c for c in session.calls
+                    if "serviceInstanceDeployV2" in c["query"])
+        self.assertIn("commitSha", call["query"],
+                      "commit_sha was given but never reached the mutation")
+        self.assertEqual("abc123", call["variables"]["sha"])
+        self.assertEqual("abc123", result["commitSha"])
+
+    async def test_a_missing_service_or_environment_builds_nothing(self):
+        """Both ids are refused when absent rather than defaulted. Guessing here
+        rebuilds a production service that nobody named."""
+        for args in ({"environment_id": "e1"},
+                     {"service_id": "svc1"},
+                     {},
+                     {"environment_id": "  ", "service_id": "svc1"}):
+            with self.subTest(args=args):
+                session = self.install(self._DEPLOYS)
+                result = json.loads(await _text(
+                    server.mcp.call_tool("create_deployment", args)))
+                self.assertIn("error", result)
+                self.assertEqual([], session.calls,
+                                 f"called Railway anyway for {args}")
+
+    async def test_an_id_that_reads_as_a_list_or_pattern_builds_nothing(self):
+        """Same refusal delete_service makes: an id carrying a separator or a
+        wildcard means a SET of services was meant, and there is no bulk
+        deploy. Resolving it to the nearest one would rebuild the wrong live
+        service."""
+        for sid in ("svc1,svc2", "svc*", "svc1;svc2", "svc1|svc2"):
+            with self.subTest(service_id=sid):
+                session = self.install(self._DEPLOYS)
+                result = json.loads(await _text(server.mcp.call_tool(
+                    "create_deployment", {"environment_id": "e1", "service_id": sid})))
+                self.assertIn("error", result)
+                self.assertEqual([], session.calls,
+                                 f"deployed anyway for the set-like id {sid!r}")
+
+    async def test_a_railway_refusal_names_both_ids_instead_of_echoing_it(self):
+        """Railway answers a wrong id, a mismatched project/environment pair and
+        an unknown commit through the same generic message, which reads as if
+        the service were gone. Say what was attempted."""
+        self.install({"serviceInstanceDeployV2": {
+            "errors": [{"message": "Not Authorized"}]}})
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "create_deployment", {"environment_id": "e1", "service_id": "svc1",
+                                  "commit_sha": "abc123"})))
+
+        self.assertIn("svc1", result["error"])
+        self.assertIn("e1", result["error"])
+        self.assertIn("abc123", result["hint"],
+                      "a named commit is the third way this call fails and the "
+                      "message does not mention it")
+
+    async def test_deploy_still_only_restarts(self):
+        """The old tool is unchanged. It is not quietly upgraded into a real
+        deploy: callers that rely on it restarting must keep getting a restart,
+        and nothing may be built behind their backs."""
+        session = self.install({
+            "deployments(input:": {"deployments": {"edges": [
+                {"node": {"id": "dep-live", "createdAt": "2026-08-04T10:00:00Z",
+                          "status": "SUCCESS"}},
+            ]}},
+            "deploymentRestart": {"deploymentRestart": True},
+        })
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "deploy", {"project_id": "p1", "environment_id": "e1", "service_id": "svc1"})))
+
+        self.assertEqual({"deploymentId": "dep-live", "deploymentStatus": "SUCCESS",
+                          "restarted": True}, result,
+                         "deploy's answer changed — callers parse this")
+        self.assertFalse([c for c in session.calls if "DeployV2" in c["query"]],
+                         "deploy now builds — that is a behaviour change, not a "
+                         "clarification")
+
+    async def test_the_two_descriptions_cannot_be_confused(self):
+        """The card was about a name, and the fix is carried by the two
+        descriptions: whoever reads only the tool list must be able to pick
+        correctly. Lock the words that make that possible, so a later tidy-up
+        of the docstrings cannot quietly undo the fix."""
+        tools = {t.name: (t.description or "").lower()
+                 for t in await server.mcp.list_tools()}
+
+        self.assertIn("restart", tools["deploy"],
+                      "deploy's description does not say that it restarts")
+        self.assertIn("does not", tools["deploy"],
+                      "deploy's description does not deny building")
+        self.assertIn("create_deployment", tools["deploy"],
+                      "deploy does not point at the tool that really deploys")
+
+        self.assertIn("build", tools["create_deployment"],
+                      "create_deployment's description does not say it builds")
+        self.assertIn("deploy", tools["create_deployment"])
+
+
 # ── stopping a service, and finding one that is stopped ─────────────
 
 class StopStartTest(_StubbedServer):
