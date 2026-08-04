@@ -1,0 +1,295 @@
+{
+  "check_variable": {
+    "required": [
+      "environment_id",
+      "key",
+      "project_id",
+      "service_id"
+    ],
+    "args": {
+      "environment_id": "string",
+      "key": "string",
+      "project_id": "string",
+      "service_id": "string"
+    }
+  },
+  "connect_service": {
+    "required": [
+      "repo",
+      "service_id"
+    ],
+    "args": {
+      "branch": "string",
+      "repo": "string",
+      "service_id": "string"
+    }
+  },
+  "create_custom_domain": {
+    "required": [
+      "domain",
+      "environment_id",
+      "project_id",
+      "service_id"
+    ],
+    "args": {
+      "domain": "string",
+      "environment_id": "string",
+      "project_id": "string",
+      "service_id": "string",
+      "target_port": "integer"
+    }
+  },
+  "create_project": {
+    "required": [
+      "name"
+    ],
+    "args": {
+      "description": "string",
+      "name": "string",
+      "workspace_id": "string"
+    }
+  },
+  "create_service": {
+    "required": [
+      "environment_id",
+      "name",
+      "project_id"
+    ],
+    "args": {
+      "environment_id": "string",
+      "name": "string",
+      "project_id": "string"
+    }
+  },
+  "create_service_domain": {
+    "required": [
+      "environment_id",
+      "project_id",
+      "service_id"
+    ],
+    "args": {
+      "environment_id": "string",
+      "project_id": "string",
+      "service_id": "string",
+      "target_port": "integer"
+    }
+  },
+  "create_volume": {
+    "required": [
+      "environment_id",
+      "mount_path",
+      "project_id",
+      "service_id"
+    ],
+    "args": {
+      "environment_id": "string",
+      "mount_path": "string",
+      "project_id": "string",
+      "region": "string",
+      "service_id": "string"
+    }
+  },
+  "delete_service_domain": {
+    "required": [
+      "domain_id"
+    ],
+    "args": {
+      "domain_id": "string"
+    }
+  },
+  "delete_volume": {
+    "required": [
+      "volume_id"
+    ],
+    "args": {
+      "volume_id": "string"
+    }
+  },
+  "deploy": {
+    "required": [
+      "environment_id",
+      "project_id",
+      "service_id"
+    ],
+    "args": {
+      "environment_id": "string",
+      "project_id": "string",
+      "service_id": "string"
+    }
+  },
+  "get_custom_domain_details": {
+    "required": [
+      "domain",
+      "environment_id",
+      "project_id",
+      "service_id"
+    ],
+    "args": {
+      "domain": "string",
+      "environment_id": "string",
+      "project_id": "string",
+      "service_id": "string"
+    }
+  },
+  "get_logs": {
+    "required": [
+      "environment_id",
+      "project_id",
+      "service_id"
+    ],
+    "args": {
+      "environment_id": "string",
+      "limit": "integer",
+      "project_id": "string",
+      "service_id": "string"
+    }
+  },
+  "get_metrics": {
+    "required": [
+      "environment_id",
+      "project_id",
+      "service_id",
+      "start_date"
+    ],
+    "args": {
+      "end_date": "string",
+      "environment_id": "string",
+      "measurements": "array|null",
+      "project_id": "string",
+      "sample_rate_seconds": "integer",
+      "service_id": "string",
+      "start_date": "string"
+    }
+  },
+  "get_service_instance": {
+    "required": [
+      "environment_id",
+      "service_id"
+    ],
+    "args": {
+      "environment_id": "string",
+      "service_id": "string"
+    }
+  },
+  "list_environments": {
+    "required": [
+      "project_id"
+    ],
+    "args": {
+      "project_id": "string"
+    }
+  },
+  "list_projects": {
+    "required": [],
+    "args": {}
+  },
+  "list_regions": {
+    "required": [],
+    "args": {}
+  },
+  "list_service_domains": {
+    "required": [
+      "environment_id",
+      "project_id",
+      "service_id"
+    ],
+    "args": {
+      "environment_id": "string",
+      "project_id": "string",
+      "service_id": "string"
+    }
+  },
+  "list_services": {
+    "required": [],
+    "args": {
+      "project_id": "string"
+    }
+  },
+  "list_variables": {
+    "required": [
+      "environment_id",
+      "project_id"
+    ],
+    "args": {
+      "environment_id": "string",
+      "project_id": "string",
+      "service_id": "string"
+    }
+  },
+  "list_volumes": {
+    "required": [],
+    "args": {
+      "project_id": "string"
+    }
+  },
+  "set_region": {
+    "required": [
+      "environment_id",
+      "region",
+      "service_id"
+    ],
+    "args": {
+      "environment_id": "string",
+      "redeploy": "boolean",
+      "region": "string",
+      "service_id": "string"
+    }
+  },
+  "set_start_command": {
+    "required": [
+      "environment_id",
+      "service_id",
+      "start_command"
+    ],
+    "args": {
+      "environment_id": "string",
+      "redeploy": "boolean",
+      "service_id": "string",
+      "start_command": "string"
+    }
+  },
+  "set_variables": {
+    "required": [
+      "environment_id",
+      "project_id",
+      "service_id",
+      "variables"
+    ],
+    "args": {
+      "environment_id": "string",
+      "project_id": "string",
+      "service_id": "string",
+      "variables": "object"
+    }
+  },
+  "update_service_domain": {
+    "required": [
+      "domain",
+      "environment_id",
+      "service_domain_id",
+      "service_id"
+    ],
+    "args": {
+      "domain": "string",
+      "environment_id": "string",
+      "service_domain_id": "string",
+      "service_id": "string",
+      "target_port": "integer"
+    }
+  },
+  "update_volume_mount": {
+    "required": [
+      "volume_id"
+    ],
+    "args": {
+      "environment_id": "string",
+      "mount_path": "string",
+      "service_id": "string",
+      "volume_id": "string"
+    }
+  },
+  "whoami": {
+    "required": [],
+    "args": {}
+  }
+}
