@@ -105,7 +105,7 @@ async def create_project(name: str, description: str = "", workspace_id: str = "
     """
     wid = workspace_id
     if not wid:
-        workspaces = await _query("query { me { workspaces { id name } } }")["me"]["workspaces"]
+        workspaces = (await _query("query { me { workspaces { id name } } }"))["me"]["workspaces"]
         if len(workspaces) == 1:
             wid = workspaces[0]["id"]
         elif not workspaces:
