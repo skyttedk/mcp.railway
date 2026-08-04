@@ -260,6 +260,55 @@ class RegressionTest(_StubbedServer):
                          f"expected one round trip, made {len(session.calls)}")
 
 
+    async def test_deploy_restarts_the_deployment_not_the_service(self):
+        """`deploymentRestart(id:)` takes a DEPLOYMENT id, but deploy passed the
+        SERVICE id. Railway then answered "Deployment not found" on a service
+        with a live, healthy deployment — true of the id it was given, and
+        completely misleading about the service. deploy must resolve the current
+        deployment first, exactly as get_logs already does."""
+        session = self.install({
+            "deployments(input:": {"deployments": {"edges": [
+                {"node": {"id": "dep-old", "createdAt": "2026-08-01T10:00:00Z",
+                          "status": "SUCCESS"}},
+                {"node": {"id": "dep-live", "createdAt": "2026-08-04T10:00:00Z",
+                          "status": "SUCCESS"}},
+            ]}},
+            "deploymentRestart": {"deploymentRestart": True},
+        })
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "deploy", {"project_id": "p1", "environment_id": "e1", "service_id": "svc1"})))
+
+        self.assertNotIn("error", result)
+        self.assertEqual("dep-live", result["deploymentId"],
+                         "restarted the wrong deployment — it must be the newest")
+        restart = next(c for c in session.calls if "deploymentRestart" in c["query"])
+        self.assertEqual("dep-live", restart["variables"]["did"],
+                         "the service id was sent to deploymentRestart again — "
+                         "that is the original 'Deployment not found' defect")
+        self.assertNotIn("svc1", restart["variables"].values())
+
+    async def test_deploy_reports_why_when_nothing_is_restartable(self):
+        """The other half of the defect: when there genuinely is nothing to
+        restart, say so specifically instead of leaving Railway to blame a
+        missing deployment. And do not fire the mutation blindly."""
+        session = self.install({
+            "deployments(input:": {"deployments": {"edges": [
+                {"node": {"id": "dep-dead", "createdAt": "2026-08-04T10:00:00Z",
+                          "status": "FAILED"}},
+            ]}},
+            "deploymentRestart": {"deploymentRestart": True},
+        })
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "deploy", {"project_id": "p1", "environment_id": "e1", "service_id": "svc1"})))
+
+        self.assertIn("FAILED", result.get("error", ""))
+        self.assertEqual(["FAILED"], result["recentStatuses"])
+        self.assertFalse([c for c in session.calls if "deploymentRestart" in c["query"]],
+                         "restarted anyway despite having no restartable deployment")
+
+
 async def _text(call) -> str:
     """Pull the tool's string return value out of whatever call_tool answers.
 
