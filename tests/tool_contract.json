@@ -262,6 +262,28 @@
       "variables": "object"
     }
   },
+  "start_service": {
+    "required": [
+      "environment_id",
+      "service_id"
+    ],
+    "args": {
+      "environment_id": "string",
+      "service_id": "string"
+    }
+  },
+  "stop_service": {
+    "required": [
+      "environment_id",
+      "project_id",
+      "service_id"
+    ],
+    "args": {
+      "environment_id": "string",
+      "project_id": "string",
+      "service_id": "string"
+    }
+  },
   "update_service_domain": {
     "required": [
       "domain",

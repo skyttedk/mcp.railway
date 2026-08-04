@@ -186,7 +186,16 @@ async def list_services(project_id: str = "") -> str:
     Each service includes its per-environment `instances` with the region
     override; region null means the service runs in Railway's default region
     (no per-service override) — use get_service_instance / list_regions for
-    details."""
+    details.
+
+    Every instance also carries `latestDeployment` {id, status,
+    deploymentStopped}, which is how you tell a stopped service from a running
+    one: Railway has NO "stopped" deployment status, so a deployment stopped by
+    stop_service keeps the status it already had (usually SUCCESS) and is
+    flagged deploymentStopped=true instead. Without that flag a stopped service
+    looks identical to a live one here — and a service whose domain has been
+    removed shows up nowhere else — which is exactly how a service ends up
+    forgotten. latestDeployment null means the service has never deployed."""
     pid = _pid(project_id)
     if not pid:
         return json.dumps({"error": "No project_id provided and RAILWAY_PROJECT_ID not set"})
@@ -194,7 +203,12 @@ async def list_services(project_id: str = "") -> str:
       project(id: $id) { services { edges { node {
         id
         name
-        serviceInstances { edges { node { environmentId region numReplicas } } }
+        serviceInstances { edges { node {
+          environmentId
+          region
+          numReplicas
+          latestDeployment { id status deploymentStopped }
+        } } }
       } } } }
     }""", {"id": pid})
     services = []
@@ -507,6 +521,110 @@ async def deploy(project_id: str, environment_id: str, service_id: str) -> str:
     return json.dumps({"deploymentId": target["id"],
                        "deploymentStatus": target["status"],
                        "restarted": data.get("deploymentRestart")})
+
+
+# A deployment can only be stopped while it still has a container. Same set as
+# _RESTARTABLE_STATUSES and for the same reason, but kept separate because the
+# two answer different questions and Railway is free to move one without the
+# other. NB: there is no STOPPED status in Railway's DeploymentStatus enum — a
+# stopped deployment keeps the status it had and is marked deploymentStopped,
+# so status alone can never tell you whether a service is running.
+_STOPPABLE_STATUSES = ("SUCCESS", "SLEEPING", "CRASHED")
+
+
+@mcp.tool()
+async def stop_service(project_id: str, environment_id: str, service_id: str) -> str:
+    """Stop a service: tear down its running container so it stops consuming
+    (and billing) compute. Reversible — start_service brings it back.
+
+    This is NOT a delete. The service, its source, its variables, its domains
+    and its volumes all survive untouched; only the running container goes away.
+    There is no delete tool here on purpose.
+
+    Railway's deploymentStop takes a DEPLOYMENT id, not a service id — the same
+    trap deploy() documents — so this resolves the service's newest running
+    deployment first and stops that one. A service with nothing running is
+    reported as such rather than being blamed on a missing deployment.
+
+    Afterwards the deployment KEEPS its old status (Railway has no STOPPED
+    status) and carries deploymentStopped=true; list_services surfaces that per
+    instance, so a stopped service stays visible instead of silently looking
+    like a healthy one.
+    """
+    deployments = await _query("""query($input: DeploymentListInput!) {
+      deployments(input: $input, first: 10) {
+        edges { node { id createdAt status deploymentStopped } }
+      }
+    }""", {"input": {
+        "projectId": project_id, "environmentId": environment_id, "serviceId": service_id
+    }})
+    nodes = [e["node"] for e in deployments.get("deployments", {}).get("edges", [])]
+    if not nodes:
+        return json.dumps({"error": "No deployments found for this project/environment/service"})
+    nodes.sort(key=lambda d: d["createdAt"], reverse=True)
+
+    with_container = [d for d in nodes if d["status"] in _STOPPABLE_STATUSES]
+    target = next((d for d in with_container if not d.get("deploymentStopped")), None)
+    if target is None:
+        if with_container:
+            already = with_container[0]
+            return json.dumps({
+                "error": f"Deployment {already['id']} is already stopped — it is "
+                         f"flagged deploymentStopped even though its status is "
+                         f"still {already['status']}, which is how Railway "
+                         "represents a stopped deployment. Nothing to do; use "
+                         "start_service to bring the service back up.",
+                "deploymentId": already["id"],
+                "alreadyStopped": True,
+            })
+        return json.dumps({
+            "error": "No running deployment to stop for this service — its newest "
+                     f"deployment is {nodes[0]['status']}, so it has no container "
+                     "and is not billing compute. Stopping needs a deployment "
+                     "that is running (or crashed/sleeping).",
+            "recentStatuses": [d["status"] for d in nodes[:5]],
+        })
+
+    data = await _query("""mutation($did: String!) {
+      deploymentStop(id: $did)
+    }""", {"did": target["id"]})
+    return json.dumps({"deploymentId": target["id"],
+                       "deploymentStatus": target["status"],
+                       "stopped": data.get("deploymentStop"),
+                       "note": "Reversible: start_service(environment_id, service_id) "
+                               "brings this service back up. The deployment keeps "
+                               "its status and is now flagged deploymentStopped."})
+
+
+@mcp.tool()
+async def start_service(environment_id: str, service_id: str) -> str:
+    """Start a service that stop_service stopped, by redeploying its instance.
+
+    The undo half of stop_service. It goes through serviceInstanceRedeploy,
+    which addresses the SERVICE and ENVIRONMENT directly, so it needs no
+    deployment id and does not care what state the stopped deployment was left
+    in. The service comes back with the same source, variables, domains and
+    volumes it had before.
+    """
+    try:
+        data = await _query("""mutation($sid: String!, $eid: String!) {
+          serviceInstanceRedeploy(serviceId: $sid, environmentId: $eid)
+        }""", {"sid": service_id, "eid": environment_id})
+    except RuntimeError as exc:
+        # Railway answers a wrong or mismatched id pair with a generic
+        # not-found/not-authorised message that reads as if the service were
+        # gone. Say which ids were actually sent, so the next step is obvious.
+        return json.dumps({
+            "error": f"Railway refused to redeploy service {service_id} in "
+                     f"environment {environment_id}: {exc}",
+            "hint": "Both ids must belong to the same project — service ids come "
+                    "from list_services, environment ids from list_environments. "
+                    "Railway reports a mismatched pair the same way it reports a "
+                    "missing one, so check the pair before concluding the service "
+                    "is gone.",
+        })
+    return json.dumps({"serviceId": service_id, "environmentId": environment_id,
+                       "started": data.get("serviceInstanceRedeploy")})
 
 
 # ── domain tools ────────────────────────────────────────────────────

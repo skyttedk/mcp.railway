@@ -131,6 +131,10 @@ class _FakeSession:
     Records every call, answers from `routes` (first substring of the GraphQL
     query that matches wins), and optionally blocks for `delay` seconds so a
     slow Railway can be simulated without a slow Railway.
+
+    A route value is the GraphQL `data` payload, unless it already carries an
+    "errors" key — then it is sent as-is, which is how a test asks for a real
+    GraphQL error (the kind `_query_sync` turns into a RuntimeError).
     """
 
     def __init__(self, routes: dict[str, dict], delay: float = 0.0):
@@ -146,7 +150,7 @@ class _FakeSession:
             time.sleep(self.delay)
         for marker, data in self.routes.items():
             if marker in query:
-                return _FakeResponse({"data": data})
+                return _FakeResponse(data if "errors" in data else {"data": data})
         return _FakeResponse({"data": {}})
 
 
@@ -307,6 +311,158 @@ class RegressionTest(_StubbedServer):
         self.assertEqual(["FAILED"], result["recentStatuses"])
         self.assertFalse([c for c in session.calls if "deploymentRestart" in c["query"]],
                          "restarted anyway despite having no restartable deployment")
+
+
+# ── stopping a service, and finding one that is stopped ─────────────
+
+class StopStartTest(_StubbedServer):
+    """Halting a service must be reversible, honest about what it did, and
+    visible afterwards. The failure this guards is not a crash: it is a stopped
+    service that still looks like a running one (Railway has no STOPPED status),
+    or a stop that reports the platform's own misleading "not found" because it
+    was handed a service id where a deployment id was expected."""
+
+    _RUNNING = {
+        "deployments(input:": {"deployments": {"edges": [
+            {"node": {"id": "dep-old", "createdAt": "2026-08-01T10:00:00Z",
+                      "status": "SUCCESS", "deploymentStopped": False}},
+            {"node": {"id": "dep-live", "createdAt": "2026-08-04T10:00:00Z",
+                      "status": "SUCCESS", "deploymentStopped": False}},
+        ]}},
+        # "deploymentStop(id:" and not "deploymentStop": the LIST query selects
+        # the field deploymentStopped, which contains that substring.
+        "deploymentStop(id:": {"deploymentStop": True},
+    }
+
+    async def test_stop_service_stops_the_deployment_not_the_service(self):
+        """deploymentStop takes a DEPLOYMENT id, exactly like deploymentRestart.
+        Passing the service id would produce "Deployment not found" about a
+        service that is running perfectly well — the defect deploy() already
+        carries a regression test for."""
+        session = self.install(self._RUNNING)
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "stop_service", {"project_id": "p1", "environment_id": "e1",
+                             "service_id": "svc1"})))
+
+        self.assertNotIn("error", result)
+        self.assertEqual("dep-live", result["deploymentId"],
+                         "stopped the wrong deployment — it must be the newest")
+        self.assertIs(True, result["stopped"])
+        stop = next(c for c in session.calls if "deploymentStop(id:" in c["query"])
+        self.assertEqual("dep-live", stop["variables"]["did"],
+                         "a service id was sent to deploymentStop")
+        self.assertNotIn("svc1", stop["variables"].values())
+
+    async def test_stop_service_says_when_it_is_already_stopped(self):
+        """A stopped deployment keeps its old status, so 'SUCCESS' proves
+        nothing. Read deploymentStopped, and say so plainly instead of stopping
+        it a second time."""
+        session = self.install({
+            "deployments(input:": {"deployments": {"edges": [
+                {"node": {"id": "dep-live", "createdAt": "2026-08-04T10:00:00Z",
+                          "status": "SUCCESS", "deploymentStopped": True}},
+            ]}},
+            # "deploymentStop(id:" and not "deploymentStop": the LIST query selects
+        # the field deploymentStopped, which contains that substring.
+        "deploymentStop(id:": {"deploymentStop": True},
+        })
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "stop_service", {"project_id": "p1", "environment_id": "e1",
+                             "service_id": "svc1"})))
+
+        self.assertTrue(result["alreadyStopped"])
+        self.assertIn("already stopped", result["error"])
+        self.assertIn("start_service", result["error"],
+                      "an already-stopped service must be told how to come back")
+        self.assertFalse([c for c in session.calls if "deploymentStop(id:" in c["query"]],
+                         "stopped a deployment that was already stopped")
+
+    async def test_stop_service_reports_why_when_nothing_is_running(self):
+        """Nothing to stop is a legitimate answer. It must name the actual
+        status rather than letting Railway blame a missing deployment, and it
+        must not fire the mutation on a hope."""
+        session = self.install({
+            "deployments(input:": {"deployments": {"edges": [
+                {"node": {"id": "dep-dead", "createdAt": "2026-08-04T10:00:00Z",
+                          "status": "FAILED", "deploymentStopped": False}},
+            ]}},
+            # "deploymentStop(id:" and not "deploymentStop": the LIST query selects
+        # the field deploymentStopped, which contains that substring.
+        "deploymentStop(id:": {"deploymentStop": True},
+        })
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "stop_service", {"project_id": "p1", "environment_id": "e1",
+                             "service_id": "svc1"})))
+
+        self.assertIn("FAILED", result.get("error", ""))
+        self.assertEqual(["FAILED"], result["recentStatuses"])
+        self.assertFalse([c for c in session.calls if "deploymentStop(id:" in c["query"]],
+                         "stopped something despite having nothing to stop")
+
+    async def test_stop_service_reports_a_service_that_never_deployed(self):
+        """No deployments at all is a different answer from none running."""
+        self.install({"deployments(input:": {"deployments": {"edges": []}}})
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "stop_service", {"project_id": "p1", "environment_id": "e1",
+                             "service_id": "svc1"})))
+
+        self.assertIn("No deployments found", result["error"])
+
+    async def test_start_service_addresses_the_service_not_a_deployment(self):
+        """The undo path deliberately avoids deployment ids: it must work even
+        when the stopped deployment was left in a state nothing can restart."""
+        session = self.install({
+            "serviceInstanceRedeploy": {"serviceInstanceRedeploy": True}})
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "start_service", {"environment_id": "e1", "service_id": "svc1"})))
+
+        self.assertIs(True, result["started"])
+        call = session.calls[0]
+        self.assertEqual({"sid": "svc1", "eid": "e1"}, call["variables"])
+        self.assertNotIn("deploymentRestart", call["query"])
+
+    async def test_start_service_explains_a_refusal_instead_of_echoing_it(self):
+        """Railway answers a mismatched service/environment pair the same way it
+        answers a deleted service. Echoing that verbatim would tell an agent its
+        service is gone when the ids were simply crossed."""
+        self.install({"serviceInstanceRedeploy": {
+            "errors": [{"message": "Not Authorized"}]}})
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "start_service", {"environment_id": "e1", "service_id": "svc1"})))
+
+        self.assertIn("svc1", result["error"])
+        self.assertIn("e1", result["error"])
+        self.assertIn("Not Authorized", result["error"],
+                      "the platform's own message must survive, not be swallowed")
+        self.assertIn("list_environments", result["hint"])
+
+    async def test_list_services_shows_that_a_service_is_stopped(self):
+        """The invisible-orphan half of the card: a stopped service keeps status
+        SUCCESS, and one stripped of its domain appears nowhere else. If the
+        listing does not carry deploymentStopped, nothing an agent can see says
+        the service is down."""
+        self.install({"project(id:": {"project": {"services": {"edges": [
+            {"node": {"id": "svc1", "name": "halted", "serviceInstances": {"edges": [
+                {"node": {"environmentId": "e1", "region": None, "numReplicas": 1,
+                          "latestDeployment": {"id": "dep-live", "status": "SUCCESS",
+                                               "deploymentStopped": True}}},
+            ]}}},
+        ]}}}})
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "list_services", {"project_id": "p1"})))
+
+        instance = result[0]["instances"][0]
+        self.assertTrue(instance["latestDeployment"]["deploymentStopped"],
+                        "a stopped service is indistinguishable from a running "
+                        "one in this listing")
+        self.assertEqual("SUCCESS", instance["latestDeployment"]["status"])
 
 
 async def _text(call) -> str:
