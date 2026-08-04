@@ -269,11 +269,29 @@ def list_environments(project_id: str) -> str:
 
 @mcp.tool()
 def list_variables(project_id: str, environment_id: str, service_id: str = "") -> str:
-    """List variables for a project/environment/service."""
+    """List which variables are set on a project/environment/service.
+
+    Values are NEVER returned — only names plus safe metadata, so the response
+    is safe to log or share. Returns a list of {key, length, sha256_16} sorted
+    by key, the same shape check_variable reports for one key: sha256_16 is the
+    first 16 hex chars of sha256(value). Compare hashes between environments to
+    see where they differ, or against a locally computed hash to confirm a
+    rotation landed — without the value leaving the server. To confirm a single
+    expected value, use check_variable. There is no mode that returns raw
+    values; read them in the Railway dashboard if a human truly needs one."""
+    import hashlib
     data = _query("""query($pid: String!, $eid: String!, $sid: String!) {
       variables(projectId: $pid, environmentId: $eid, serviceId: $sid)
     }""", {"pid": project_id, "eid": environment_id, "sid": service_id})
-    return json.dumps(data["variables"])
+    variables = data["variables"] or {}
+    return json.dumps([
+        {
+            "key": k,
+            "length": len(str(v)),
+            "sha256_16": hashlib.sha256(str(v).encode()).hexdigest()[:16],
+        }
+        for k, v in sorted(variables.items())
+    ])
 
 @mcp.tool()
 def check_variable(project_id: str, environment_id: str,
