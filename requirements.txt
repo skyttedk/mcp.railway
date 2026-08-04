@@ -2,5 +2,9 @@
 # imports. An unpinned >=1.2.0 resolves to 2.0.0 and crash-loops the service on
 # ModuleNotFoundError at import time. Moving to 2.x is a code change.
 mcp>=1.2.0,<2
+# Load-bearing at import time: server.py offloads every blocking Railway call to
+# an anyio worker thread. It arrives with mcp anyway, but the tools break without
+# it, so it is named here rather than left to a transitive dependency.
+anyio>=4.5
 requests>=2.28.0
 python-dotenv>=1.0.0
