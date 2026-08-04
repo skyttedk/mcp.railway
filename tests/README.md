@@ -72,6 +72,21 @@ and average off every raw sample. A spike averaged into a five-minute point is
 still the peak; a summary computed from the surviving points would report the
 service as calm through the one minute it was not.
 
+And one class for where a log answer came from (`LogProvenanceTest`), because
+the newest deployment is not always the one serving traffic and the gap opens
+at exactly the wrong moment: a build fails, someone reads the logs to find out
+why the service is misbehaving, and gets the failed attempt's output while the
+previous version is still handling every request. The status was always in the
+response, so the tests are not about adding data but about making the mismatch
+impossible to miss — a warning that leads the answer and names both
+deployments, and, just as firmly, no warning at all when the logs are the
+running deployment's, since one that fires every time is one nobody reads. They
+also hold `get_logs` to reading `deploymentStopped` rather than trusting
+`SUCCESS`, to fetching by deployment id rather than service id, to refusing
+`source="running"` when nothing is running instead of quietly relabelling the
+failed build's logs — and to leaving the default answer the newest deployment's,
+so existing callers are untouched.
+
 ## After an intended change to a tool's arguments
 
 The contract test fails on purpose. Confirm the change is wanted, then:

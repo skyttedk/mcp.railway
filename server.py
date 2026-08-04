@@ -454,18 +454,67 @@ async def set_variables(project_id: str, environment_id: str,
     }})
     return json.dumps(result)
 
+# Statuses of a deployment that has been RELEASED and still holds the service's
+# container — i.e. the one a request to the service reaches right now. Anything
+# else either never got that far (FAILED, SKIPPED, BUILDING, DEPLOYING, QUEUED…)
+# or has already handed over (REMOVED, REMOVING): Railway supersedes the
+# previous deployment only once a new one succeeds, which is precisely why a
+# failed build leaves the OLD deployment serving traffic.
+#
+# Same three values as _RESTARTABLE_STATUSES / _STOPPABLE_STATUSES, kept
+# separate for the reason those two are: they answer different questions and
+# Railway is free to move one without the others. CRASHED counts here because
+# the service is still ON that deployment — it is the release whose logs matter,
+# even though it is failing to stay up.
+#
+# Status alone is never enough: a deployment stopped by stop_service keeps the
+# status it had (Railway has no STOPPED status) and is flagged deploymentStopped,
+# so that flag has to be read too or a stopped service reads as a running one.
+_LIVE_STATUSES = ("SUCCESS", "SLEEPING", "CRASHED")
+
+
+def _running_deployment(nodes: list[dict]) -> dict | None:
+    """The deployment the service is actually running, newest first, or None."""
+    return next((d for d in nodes
+                 if d["status"] in _LIVE_STATUSES and not d.get("deploymentStopped")),
+                None)
+
+
 @mcp.tool()
 async def get_logs(project_id: str, environment_id: str, service_id: str,
-             limit: int = 50) -> str:
-    """Get recent deployment logs for a service.
+             limit: int = 50, source: str = "latest") -> str:
+    """Get recent deployment logs for a service, and say which deployment they
+    came from.
 
     Railway's API has no deploymentLogs(projectId/environmentId/serviceId) query —
-    logs are keyed by deploymentId. This looks up the most recent deployment for
-    the given project/environment/service, then fetches that deployment's logs.
+    logs are keyed by deploymentId. This looks up the service's deployments for
+    the given project/environment, picks one, then fetches that deployment's logs.
+
+    THE NEWEST DEPLOYMENT IS NOT ALWAYS THE ONE SERVING TRAFFIC. A build that
+    fails is still the newest deployment, while the service keeps running the
+    previous, working one — so by default these logs can describe a version that
+    no request ever reaches. The answer therefore always carries
+    `deploymentIsRunning`, and when it is false it leads with a `warning` naming
+    both deployments. When the logs ARE the running deployment's, there is no
+    warning and nothing extra to read past.
+
+    source:
+      "latest"  (default, unchanged behaviour) — the most recent deployment,
+                whether or not it succeeded. What you want after a deploy: the
+                failed build's own output is the reason it failed.
+      "running" — the deployment currently holding the service's container
+                (newest one that is SUCCESS/SLEEPING/CRASHED and not stopped).
+                What you want when investigating live behaviour. Refuses,
+                naming the recent statuses, if nothing is running.
     """
+    if source not in ("latest", "running"):
+        return json.dumps({"error": f"Unknown source {source!r} — use \"latest\" "
+                                    "(the most recent deployment, the default) or "
+                                    "\"running\" (the one serving traffic)."})
+
     deployments = await _query("""query($input: DeploymentListInput!) {
-      deployments(input: $input, first: 5) {
-        edges { node { id createdAt status } }
+      deployments(input: $input, first: 10) {
+        edges { node { id createdAt status deploymentStopped } }
       }
     }""", {"input": {
         "projectId": project_id, "environmentId": environment_id, "serviceId": service_id
@@ -473,15 +522,61 @@ async def get_logs(project_id: str, environment_id: str, service_id: str,
     edges = deployments.get("deployments", {}).get("edges", [])
     if not edges:
         return json.dumps({"error": "No deployments found for this project/environment/service"})
-    latest = sorted((e["node"] for e in edges), key=lambda d: d["createdAt"], reverse=True)[0]
+    nodes = sorted((e["node"] for e in edges), key=lambda d: d["createdAt"], reverse=True)
+
+    latest = nodes[0]
+    running = _running_deployment(nodes)
+
+    if source == "running":
+        if running is None:
+            return json.dumps({
+                "error": "No running deployment for this service — its newest "
+                         f"deployment is {latest['status']} and nothing older is "
+                         "still holding a container, so there are no logs from a "
+                         "running version. Call again without source=\"running\" "
+                         "to read the newest deployment's logs instead.",
+                "recentStatuses": [d["status"] for d in nodes[:5]],
+            })
+        target = running
+    else:
+        target = latest
 
     data = await _query("""query($did: String!, $limit: Int!) {
       deploymentLogs(deploymentId: $did, limit: $limit) {
         timestamp message
       }
-    }""", {"did": latest["id"], "limit": limit})
-    return json.dumps({"deploymentId": latest["id"], "deploymentStatus": latest["status"],
-                       "logs": data.get("deploymentLogs", [])})
+    }""", {"did": target["id"], "limit": limit})
+
+    result: dict = {}
+    is_running = running is not None and running["id"] == target["id"]
+    if not is_running:
+        if running is None:
+            result["warning"] = (
+                f"These logs are NOT from a running deployment. They come from "
+                f"deployment {target['id']} ({target['status']}, created "
+                f"{target['createdAt']}), and this service has NO deployment "
+                f"holding a container right now — it is stopped or has never "
+                f"deployed successfully, so nothing is serving traffic.")
+        else:
+            result["warning"] = (
+                f"These logs are NOT from the deployment serving traffic. They "
+                f"come from deployment {target['id']} ({target['status']}, created "
+                f"{target['createdAt']}), which never took over; the service is "
+                f"still running deployment {running['id']} ({running['status']}, "
+                f"created {running['createdAt']}). Call again with "
+                f"source=\"running\" to read the logs of the version actually "
+                f"serving traffic.")
+    result.update({
+        "deploymentId": target["id"],
+        "deploymentStatus": target["status"],
+        "deploymentCreatedAt": target["createdAt"],
+        "deploymentIsRunning": is_running,
+    })
+    if not is_running:
+        result["runningDeploymentId"] = running["id"] if running else None
+        result["runningDeploymentStatus"] = running["status"] if running else None
+    result["logs"] = data.get("deploymentLogs", [])
+    return json.dumps(result)
 
 # ── keeping a metrics answer small enough to read ────────────────────
 #

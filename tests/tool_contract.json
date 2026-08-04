@@ -157,7 +157,8 @@
       "environment_id": "string",
       "limit": "integer",
       "project_id": "string",
-      "service_id": "string"
+      "service_id": "string",
+      "source": "string"
     }
   },
   "get_metrics": {
