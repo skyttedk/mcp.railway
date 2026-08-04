@@ -471,6 +471,159 @@ class StopStartTest(_StubbedServer):
         self.assertEqual("SUCCESS", instance["latestDeployment"]["status"])
 
 
+class DeleteServiceTest(_StubbedServer):
+    """Deleting a service is the one operation here with no undo.
+
+    Everything else in this server can be repaired by calling something else:
+    a stopped service starts, a wrong region is set again, a deleted domain is
+    re-created. serviceDelete takes the service, its deployments, its variables,
+    its domains and its volumes' data, and none of it comes back. These tools
+    also run with permissions pre-granted, so no human sees the call before it
+    happens.
+
+    So the property under test is not "deletion works" — that is one line of
+    GraphQL. It is that delete_service destroys exactly the service it was
+    given and refuses everything else: a name it cannot resolve to one service,
+    a name that reads as a pattern or a list, an id that disagrees with the
+    name beside it, an id Railway would not confirm. Every refusal must leave
+    the account untouched, and both refusals and successes must name the
+    service, so a transcript says exactly what was destroyed.
+    """
+
+    _PROJECT = {"project(id:": {"project": {"services": {"edges": [
+        {"node": {"id": "svc-api", "name": "api"}},
+        {"node": {"id": "svc-web", "name": "web"}},
+    ]}}}}
+    _DELETE = {"serviceDelete": {"serviceDelete": True}}
+
+    @staticmethod
+    def _deletions(session: _FakeSession) -> list[dict]:
+        return [c for c in session.calls if "serviceDelete" in c["query"]]
+
+    async def _delete(self, routes: dict, args: dict) -> tuple[dict, _FakeSession]:
+        session = self.install(routes)
+        result = json.loads(await _text(server.mcp.call_tool("delete_service", args)))
+        return result, session
+
+    async def test_deleting_by_id_deletes_that_service_and_names_it(self):
+        """The happy path, and the only path that may reach the mutation: an id
+        the caller supplied, confirmed against Railway first so the answer can
+        say which service went."""
+        result, session = await self._delete(
+            {"service(id:": {"service": {"id": "svc-api", "name": "api",
+                                         "projectId": "p1"}},
+             **self._DELETE},
+            {"service_id": "svc-api"})
+
+        self.assertNotIn("error", result)
+        self.assertIs(True, result["deleted"])
+        self.assertEqual("svc-api", result["serviceId"])
+        self.assertEqual("api", result["serviceName"],
+                         "a transcript of this call must say WHICH service was "
+                         "destroyed, not just that one was")
+        self.assertIn("cannot be undone", result["note"])
+        deletions = self._deletions(session)
+        self.assertEqual(1, len(deletions), "exactly one service may be deleted per call")
+        self.assertEqual("svc-api", deletions[0]["variables"]["id"])
+
+    async def test_a_unique_name_resolves_to_exactly_that_service(self):
+        """A name is allowed only because it is checked. It must delete the
+        service that actually carries the name, never a neighbour."""
+        result, session = await self._delete(
+            {**self._PROJECT, **self._DELETE},
+            {"name": "web", "project_id": "p1"})
+
+        self.assertNotIn("error", result)
+        self.assertEqual("svc-web", result["serviceId"])
+        self.assertEqual("web", result["serviceName"])
+        self.assertEqual(["svc-web"],
+                         [d["variables"]["id"] for d in self._deletions(session)])
+
+    async def test_a_name_matching_more_than_one_service_is_refused(self):
+        """Two services share a name. There is no defensible way to pick one,
+        so nothing may be deleted — and the answer must show both, or the
+        caller cannot tell what it nearly destroyed."""
+        result, session = await self._delete(
+            {"project(id:": {"project": {"services": {"edges": [
+                {"node": {"id": "svc-1", "name": "worker"}},
+                {"node": {"id": "svc-2", "name": "worker"}},
+            ]}}}, **self._DELETE},
+            {"name": "worker", "project_id": "p1"})
+
+        self.assertIn("worker", result["error"])
+        self.assertIn("does not identify one", result["error"])
+        self.assertEqual({"svc-1", "svc-2"}, {m["id"] for m in result["matched"]},
+                         "the refusal does not say which services matched")
+        self.assertEqual([], self._deletions(session),
+                         "an ambiguous name deleted something anyway")
+
+    async def test_a_name_matching_nothing_is_refused_not_guessed(self):
+        """The dangerous shape of a typo: 'ap' is not 'api', and resolving it to
+        the closest candidate would delete a service nobody asked for."""
+        result, session = await self._delete({**self._PROJECT, **self._DELETE},
+                                             {"name": "ap", "project_id": "p1"})
+
+        self.assertIn("'ap'", result["error"])
+        self.assertIn("Nothing was deleted", result["error"])
+        self.assertIn("api", result["servicesInProject"])
+        self.assertEqual([], self._deletions(session),
+                         "a name that matched no service deleted one anyway")
+
+    async def test_a_pattern_or_a_list_is_refused_before_any_lookup(self):
+        """'delete everything matching this' must not be expressible. Refuse the
+        shape of the request itself, without even resolving it — a glob that
+        happened to match exactly one service today would teach a caller that
+        globs work here, and tomorrow it matches three."""
+        for hostile in ("mcp.*", "api,web", "svc-?", "api;web", "api|web", "%"):
+            with self.subTest(name=hostile):
+                result, session = await self._delete(
+                    {**self._PROJECT, **self._DELETE}, {"name": hostile,
+                                                        "project_id": "p1"})
+
+                self.assertIn("pattern or a list", result["error"])
+                self.assertIn(hostile, result["error"],
+                              "the refusal does not quote what was rejected")
+                self.assertEqual([], session.calls,
+                                 "a pattern was resolved against Railway instead "
+                                 "of being refused outright")
+
+    async def test_an_id_that_disagrees_with_the_name_deletes_neither(self):
+        """Passing both is a cross-check, not two chances to match. A stale id
+        beside a fresh name is exactly the situation where guessing is worst."""
+        result, session = await self._delete({**self._PROJECT, **self._DELETE},
+                                             {"service_id": "svc-api", "name": "web",
+                                              "project_id": "p1"})
+
+        self.assertIn("disagree", result["error"])
+        self.assertIn("svc-api", result["error"])
+        self.assertIn("svc-web", result["error"],
+                      "the refusal must name both candidates, or the caller "
+                      "cannot tell which one was stale")
+        self.assertEqual([], self._deletions(session))
+
+    async def test_an_unconfirmable_id_deletes_nothing(self):
+        """serviceDelete on an unknown id is harmless, but on a MISTYPED id that
+        happens to exist it is not. The lookup is the guard: if Railway will not
+        read the service back, the mutation must not fire at all."""
+        result, session = await self._delete(
+            {"service(id:": {"errors": [{"message": "Not Authorized"}]},
+             **self._DELETE},
+            {"service_id": "svc-typo"})
+
+        self.assertIn("svc-typo", result["error"])
+        self.assertIn("Not Authorized", result["error"],
+                      "the platform's own message must survive, not be swallowed")
+        self.assertEqual([], self._deletions(session),
+                         "deleted an id that could not be looked up first")
+
+    async def test_an_empty_request_deletes_nothing_and_asks_for_a_name(self):
+        """No id and no name is not 'delete the default service'."""
+        result, session = await self._delete({**self._PROJECT, **self._DELETE}, {})
+
+        self.assertIn("never chooses a service for you", result["error"])
+        self.assertEqual([], session.calls)
+
+
 class ListProjectsFailureTest(_StubbedServer):
     """list_projects tries a fast path and two fallbacks. Each swallows its own
     exception so the next one runs — correct — but when all of them come up

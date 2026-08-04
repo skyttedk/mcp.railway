@@ -39,6 +39,16 @@ resolving a deployment id rather than passing the service id to
 `deploymentStop`, and to explaining a refusal instead of echoing the platform's
 misleading "not found".
 
+And one class for deleting a service (`DeleteServiceTest`), because it is the
+only operation here that cannot be undone by calling something else, and it
+runs with permissions pre-granted — no human sees the call before it happens.
+The tests are therefore about refusal rather than about deletion: a name that
+matches no service or more than one, a name that reads as a pattern or a list,
+an id that disagrees with the name beside it, and an id Railway would not
+confirm must each leave the account untouched and say which service was meant.
+The happy path is held to deleting exactly one service and naming it, so a
+transcript records what was destroyed.
+
 And one class for the size of a `get_metrics` answer (`MetricsSizeTest`),
 because that failure is invisible from inside this repo: it costs the calling
 agent's context window rather than anything Railway or the server measures, and

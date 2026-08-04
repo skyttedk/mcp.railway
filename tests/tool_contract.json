@@ -89,6 +89,14 @@
       "service_id": "string"
     }
   },
+  "delete_service": {
+    "required": [],
+    "args": {
+      "name": "string",
+      "project_id": "string",
+      "service_id": "string"
+    }
+  },
   "delete_service_domain": {
     "required": [
       "domain_id"
