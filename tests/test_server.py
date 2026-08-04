@@ -34,6 +34,8 @@ import time
 import unittest
 from pathlib import Path
 
+import requests
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -134,7 +136,9 @@ class _FakeSession:
 
     A route value is the GraphQL `data` payload, unless it already carries an
     "errors" key — then it is sent as-is, which is how a test asks for a real
-    GraphQL error (the kind `_query_sync` turns into a RuntimeError).
+    GraphQL error (the kind `_query_sync` turns into a RuntimeError). A route
+    value that is an Exception is raised instead, which is how a test asks for
+    the failures that never reach GraphQL at all: an HTTP 401, a timeout.
     """
 
     def __init__(self, routes: dict[str, dict], delay: float = 0.0):
@@ -150,6 +154,8 @@ class _FakeSession:
             time.sleep(self.delay)
         for marker, data in self.routes.items():
             if marker in query:
+                if isinstance(data, Exception):
+                    raise data
                 return _FakeResponse(data if "errors" in data else {"data": data})
         return _FakeResponse({"data": {}})
 
@@ -463,6 +469,100 @@ class StopStartTest(_StubbedServer):
                         "a stopped service is indistinguishable from a running "
                         "one in this listing")
         self.assertEqual("SUCCESS", instance["latestDeployment"]["status"])
+
+
+class ListProjectsFailureTest(_StubbedServer):
+    """list_projects tries a fast path and two fallbacks. Each swallows its own
+    exception so the next one runs — correct — but when all of them come up
+    empty the reader used to be told to set RAILWAY_PROJECT_ID, whatever had
+    actually gone wrong. An outage, an expired token and a genuinely unscoped
+    token all looked identical, and the real cause appeared nowhere.
+
+    The round-trip test above cannot see this: it counts requests on the happy
+    path, and a swallowed failure changes no count.
+    """
+
+    def setUp(self):
+        # These tests are about the no-project-id branch, and a developer
+        # machine may well have RAILWAY_PROJECT_ID set.
+        original = server.DEFAULT_PROJECT
+        server.DEFAULT_PROJECT = ""
+        self.addCleanup(setattr, server, "DEFAULT_PROJECT", original)
+
+    @staticmethod
+    def _http(status: int) -> requests.exceptions.HTTPError:
+        response = requests.Response()
+        response.status_code = status
+        return requests.exceptions.HTTPError(f"{status} Client Error", response=response)
+
+    async def test_a_rejected_token_is_not_reported_as_missing_configuration(self):
+        """The defect itself: Railway refuses the token, and the answer blames
+        a configuration setting that is not the problem."""
+        self.install({"me { workspaces": self._http(401),
+                      "query { projects": self._http(401)})
+
+        result = json.loads(await _text(server.mcp.call_tool("list_projects", {})))
+
+        self.assertIn("refused", result["error"],
+                      "the reason the queries failed was thrown away")
+        self.assertIn("401", result["error"])
+        self.assertNotIn("RAILWAY_PROJECT_ID", result["error"],
+                         "an auth failure was reported as a missing setting — "
+                         "that is the whole defect")
+
+    async def test_an_unreachable_railway_reads_differently_from_a_refusal(self):
+        """The three cases must be distinguishable at a glance, not merely
+        'something failed'."""
+        self.install({"me { workspaces": requests.exceptions.ConnectionError("no route"),
+                      "query { projects": requests.exceptions.ConnectionError("no route")})
+
+        result = json.loads(await _text(server.mcp.call_tool("list_projects", {})))
+
+        self.assertIn("unreachable", result["error"])
+        self.assertNotIn("refused", result["error"])
+        self.assertNotIn("RAILWAY_PROJECT_ID", result["error"])
+
+    async def test_the_fallbacks_own_failure_is_reported_too(self):
+        """The fast path can succeed and simply hold no projects; then it is a
+        fallback that fails, and that silence hides just as much."""
+        self.install({
+            "me { workspaces": {"me": {"workspaces": [
+                {"id": "ws1", "name": "Solo", "projects": {"edges": []}}]}},
+            "query { projects": {"errors": [{"message": "Problem processing request"}]},
+            "workspace(workspaceId:": {"errors": [{"message": "Not Authorized"}]},
+        })
+
+        result = json.loads(await _text(server.mcp.call_tool("list_projects", {})))
+
+        self.assertIn("Problem processing request", result["error"])
+        self.assertTrue(any("Not Authorized" in a for a in result["attempts"]),
+                        "the per-workspace fan-out failed silently")
+        self.assertNotIn("RAILWAY_PROJECT_ID", result["error"])
+
+    async def test_a_genuinely_unconfigured_token_still_gets_the_old_advice(self):
+        """The other half: when nothing failed and there is simply nothing to
+        list, the configuration message is the right answer and must survive."""
+        self.install({"me { workspaces": {"me": {"workspaces": []}},
+                      "query { projects": {"projects": {"edges": []}}})
+
+        result = json.loads(await _text(server.mcp.call_tool("list_projects", {})))
+
+        self.assertIn("RAILWAY_PROJECT_ID", result["error"])
+        self.assertEqual([], result["workspaces"])
+        self.assertNotIn("attempts", result,
+                         "nothing failed, so there is no failure to report")
+
+    def test_a_failure_reason_cannot_carry_the_token(self):
+        """Error text is exactly where a credential leaks. _why must not pass
+        one through even if Railway echoes it back to us."""
+        original = server.TOKEN
+        server.TOKEN = "super-secret-token"
+        self.addCleanup(setattr, server, "TOKEN", original)
+
+        leaked = server._why(RuntimeError("bad auth: Bearer super-secret-token"))
+
+        self.assertNotIn("super-secret-token", leaked)
+        self.assertIn("***", leaked)
 
 
 async def _text(call) -> str:

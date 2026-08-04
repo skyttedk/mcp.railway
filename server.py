@@ -56,6 +56,32 @@ def _query_sync(query: str, variables: dict | None = None) -> dict:
         raise RuntimeError(data["errors"][0]["message"])
     return data["data"]
 
+def _why(exc: Exception) -> str:
+    """One short, credential-free line explaining why a Railway query failed.
+
+    Exists so a caller can tell three situations apart at a glance: nothing is
+    configured, Railway refused us, or Railway could not be reached. They are
+    otherwise indistinguishable, and the caller then goes hunting for a
+    configuration fault that does not exist.
+
+    Never let this carry the token. requests puts it in a header, not the URL,
+    so neither an HTTPError nor a ConnectionError repr contains it — but a
+    GraphQL message is Railway's text, so redact and truncate it anyway rather
+    than trusting that.
+    """
+    response = getattr(exc, "response", None)
+    if response is not None:
+        code = response.status_code
+        if code in (401, 403):
+            return f"Railway refused the token (HTTP {code})"
+        return f"Railway returned HTTP {code}"
+    if isinstance(exc, requests.exceptions.RequestException):
+        return f"Railway was unreachable ({type(exc).__name__})"
+    msg = str(exc)
+    if TOKEN:
+        msg = msg.replace(TOKEN, "***")
+    return f"Railway rejected the query: {msg[:200]}"
+
 async def _query(query: str, variables: dict | None = None) -> dict:
     """Run one GraphQL call without blocking the event loop.
 
@@ -97,7 +123,12 @@ async def list_projects() -> str:
     # constantly. `Workspace.projects` is part of Railway's schema (verified
     # against the live endpoint), so the workspace path needs no fan-out at all.
     # Output shape is unchanged: each project still carries its "workspace".
+    #
+    # Every attempt below still swallows its own failure so the next one runs —
+    # but it now records WHY, because if all of them come up empty that reason
+    # is the only thing that explains it.
     workspaces: list[dict] = []
+    failures: list[str] = []
     try:
         me = await _query("""query {
           me { workspaces { id name projects { edges { node { id name } } } } }
@@ -108,8 +139,8 @@ async def list_projects() -> str:
                   for e in ws.get("projects", {}).get("edges", [])]
         if result:
             return json.dumps(result)
-    except Exception:
-        pass
+    except Exception as exc:
+        failures.append(_why(exc))
 
     # Fallbacks, only reached when the single query yields nothing: a token that
     # sees projects but no workspaces, then the old per-workspace fan-out in
@@ -120,8 +151,8 @@ async def list_projects() -> str:
         projects = [e["node"] for e in data["projects"]["edges"]]
         if projects:
             return json.dumps(projects)
-    except Exception:
-        pass
+    except Exception as exc:
+        failures.append(_why(exc))
 
     result = []
     for ws in workspaces:
@@ -131,14 +162,21 @@ async def list_projects() -> str:
             }""", {"wid": ws["id"]})
             for e in wp["workspace"]["projects"]["edges"]:
                 result.append({**e["node"], "workspace": ws["name"]})
-        except Exception:
-            pass
+        except Exception as exc:
+            failures.append(f"workspace {ws['name']}: {_why(exc)}")
     if result:
         return json.dumps(result)
 
-    # Nothing found — tell user to set project ID
+    # Nothing found. If an attempt actually FAILED, that failure is the answer:
+    # blaming a missing RAILWAY_PROJECT_ID here sends the reader after a
+    # configuration problem that does not exist, while an outage or an expired
+    # token never surfaces anywhere. The config message below is correct only
+    # when every query succeeded and simply had nothing to return.
     if DEFAULT_PROJECT:
         return json.dumps([{"id": DEFAULT_PROJECT, "name": "(from RAILWAY_PROJECT_ID)"}])
+    if failures:
+        return json.dumps({"error": f"Could not list projects — {failures[0]}",
+                           "attempts": failures})
     return json.dumps({"error": "Token cannot list projects. Set RAILWAY_PROJECT_ID or use a less-scoped token.",
                        "workspaces": [{"id": w["id"], "name": w["name"]} for w in workspaces]})
 
