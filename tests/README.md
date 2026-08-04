@@ -39,6 +39,16 @@ resolving a deployment id rather than passing the service id to
 `deploymentStop`, and to explaining a refusal instead of echoing the platform's
 misleading "not found".
 
+And one class for the size of a `get_metrics` answer (`MetricsSizeTest`),
+because that failure is invisible from inside this repo: it costs the calling
+agent's context window rather than anything Railway or the server measures, and
+only on a long range. The tests hold `get_metrics` to bounding a day's samples,
+to saying in the response that it summarised rather than truncated, to leaving
+a short range exactly as measured — and, most importantly, to reading high, low
+and average off every raw sample. A spike averaged into a five-minute point is
+still the peak; a summary computed from the surviving points would report the
+service as calm through the one minute it was not.
+
 ## After an intended change to a tool's arguments
 
 The contract test fails on purpose. Confirm the change is wanted, then:

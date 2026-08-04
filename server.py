@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import os
 import json
+import math
 import threading
+from datetime import datetime, timezone
+
 import requests
 from anyio import to_thread
 from mcp.server.fastmcp import FastMCP
@@ -480,6 +483,131 @@ async def get_logs(project_id: str, environment_id: str, service_id: str,
     return json.dumps({"deploymentId": latest["id"], "deploymentStatus": latest["status"],
                        "logs": data.get("deploymentLogs", [])})
 
+# ── keeping a metrics answer small enough to read ────────────────────
+#
+# Railway hands back every raw sample it holds, and the scarce resource at the
+# other end of this server is the calling agent's context window, not Railway's
+# CPU. A day across a few deployments is tens of thousands of {ts, value}
+# objects, all of which land in that context and crowd out the task the caller
+# was actually doing.
+#
+# So get_metrics condenses each series to a bounded number of points — but the
+# high/low/average it reports are computed over EVERY raw sample, never over
+# the points that survived. That distinction is the whole point: a one-minute
+# CPU spike is exactly what someone asks for metrics to find, and it is exactly
+# what an average-of-averages would erase.
+
+# Points per series a caller can hold in mind (and Railway's own charts draw)
+# without the answer becoming unreadable.
+_METRIC_POINT_BUDGET = 360
+
+# Round, human-legible intervals, coarsest first at the far end. A rate derived
+# purely by division gives numbers like "every 47 s", which nobody can reason
+# about; these are the intervals a person would have chosen anyway.
+_SAMPLE_INTERVALS = (10, 30, 60, 300, 900, 1800, 3600, 21600, 86400)
+
+
+def _sample_interval_for(window_seconds: float) -> int:
+    """Finest round interval that keeps one series inside the point budget.
+
+    The bound comes from the length of the window, not from a fixed count of
+    points: an hour keeps Railway's own resolution, a day lands on 5-minute
+    points, a month on 6-hourly ones. Past a year even daily points overflow
+    the budget, so that tail falls back to plain division.
+    """
+    for interval in _SAMPLE_INTERVALS:
+        if window_seconds <= interval * _METRIC_POINT_BUDGET:
+            return interval
+    return int(math.ceil(window_seconds / _METRIC_POINT_BUDGET))
+
+
+def _epoch(value: str) -> float | None:
+    """ISO 8601 timestamp -> unix seconds, or None if it is not one."""
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp()
+    except (AttributeError, ValueError):
+        return None
+
+
+def _metrics_window(start_date: str, end_date: str, series: list[dict]) -> float:
+    """Length of the range the caller asked for, in seconds.
+
+    Falls back to the span the returned samples actually cover, so a timestamp
+    this function cannot parse costs some resolution rather than the guard.
+    """
+    start = _epoch(start_date)
+    end = _epoch(end_date) if end_date else datetime.now(timezone.utc).timestamp()
+    if start is not None and end is not None and end > start:
+        return end - start
+    stamps = [v["ts"] for s in series for v in (s.get("values") or [])
+              if isinstance(v.get("ts"), (int, float))]
+    return max(stamps) - min(stamps) if len(stamps) > 1 else 0.0
+
+
+def _condense_metrics(series: list[dict], window_seconds: float) -> list[dict]:
+    """Bound each series' point count, and say so — never silently truncate.
+
+    Each returned point is the mean of the raw samples inside one interval, and
+    every series carries a `summary` (high, low, their timestamps, average,
+    sample count) computed over all of its raw samples. A series that was
+    condensed also carries `sampleIntervalSeconds` and a `note`, so a caller can
+    tell at a glance that it is reading a summary rather than the whole series.
+    A window short enough to need no condensing is returned exactly as Railway
+    measured it.
+    """
+    interval = _sample_interval_for(window_seconds)
+    condensed = []
+    for one in series:
+        values = sorted((one.get("values") or []),
+                        key=lambda v: v.get("ts") if isinstance(v.get("ts"), (int, float)) else 0)
+        entry = {k: v for k, v in one.items() if k != "values"}
+
+        numeric = [v for v in values if isinstance(v.get("value"), (int, float))]
+        if numeric:
+            high = max(numeric, key=lambda v: v["value"])
+            low = min(numeric, key=lambda v: v["value"])
+            entry["summary"] = {
+                "high": high["value"], "highTs": high.get("ts"),
+                "low": low["value"], "lowTs": low.get("ts"),
+                "average": sum(v["value"] for v in numeric) / len(numeric),
+                "samples": len(numeric),
+            }
+
+        buckets: list[list[dict]] = []
+        previous_key = None
+        for sample in values:
+            ts = sample.get("ts")
+            key = int(ts // interval) if isinstance(ts, (int, float)) else None
+            if buckets and key is not None and key == previous_key:
+                buckets[-1].append(sample)
+            else:
+                buckets.append([sample])
+            previous_key = key
+
+        points = []
+        for group in buckets:
+            numbers = [v["value"] for v in group if isinstance(v.get("value"), (int, float))]
+            if not numbers:
+                value = None
+            elif len(numbers) == 1:
+                value = numbers[0]          # untouched, not a one-element mean
+            else:
+                value = sum(numbers) / len(numbers)
+            points.append({"ts": group[0].get("ts"), "value": value})
+        entry["values"] = points
+
+        if len(points) < len(values):
+            entry["sampleIntervalSeconds"] = interval
+            entry["note"] = (
+                f"Summarised, not truncated: {len(values)} samples condensed to "
+                f"{len(points)} points, one per {interval}s, each the mean of its "
+                "interval. No sample was dropped from `summary` — its high, low "
+                "and average cover the full range you asked for."
+            )
+        condensed.append(entry)
+    return condensed
+
+
 @mcp.tool()
 async def get_metrics(project_id: str, environment_id: str, service_id: str,
                 start_date: str, end_date: str = "",
@@ -495,6 +623,17 @@ async def get_metrics(project_id: str, environment_id: str, service_id: str,
     so each sample series carries its deploymentId tag — use that to isolate one
     deployment's window when others ran in the same project/environment/service
     during the requested range. Each value is {ts, value} (ts = unix seconds).
+
+    A wide range comes back SUMMARISED, never truncated. The sampling interval
+    is chosen from the length of the range (about an hour keeps Railway's own
+    resolution; a day becomes 5-minute points, a month 6-hourly ones), and each
+    returned point is the mean of its interval — a series that was condensed
+    says so in `sampleIntervalSeconds` and `note`. Every series also carries a
+    `summary` with high, low (each with the timestamp it occurred at), average
+    and sample count computed over ALL raw samples in the range, so a brief
+    spike is still reported even where the point holding it was averaged away.
+    For the usual "is this service healthy" question, read `summary` and ignore
+    `values` entirely.
     """
     data = await _query("""query($pid: String!, $eid: String!, $sid: String!, $start: DateTime!,
                           $end: DateTime, $measurements: [MetricMeasurement!]!, $rate: Int) {
@@ -511,7 +650,9 @@ async def get_metrics(project_id: str, environment_id: str, service_id: str,
         "measurements": measurements or ["CPU_USAGE", "MEMORY_USAGE_GB"],
         "rate": sample_rate_seconds or None,
     })
-    return json.dumps(data.get("metrics", []))
+    series = data.get("metrics") or []
+    return json.dumps(_condense_metrics(
+        series, _metrics_window(start_date, end_date, series)))
 
 # Statuses whose deployment still has a container to restart. Everything else
 # either never ran (FAILED, SKIPPED), is already gone (REMOVED, REMOVING) or is
