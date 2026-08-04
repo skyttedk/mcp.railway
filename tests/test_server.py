@@ -565,6 +565,112 @@ class ListProjectsFailureTest(_StubbedServer):
         self.assertIn("***", leaked)
 
 
+class MetricsSizeTest(_StubbedServer):
+    """get_metrics used to return every sample Railway held, unbounded.
+
+    The cost of that lands nowhere this repo can see it: not on Railway, but in
+    the context window of the agent that asked, where a day across a few
+    deployments is tens of thousands of {ts, value} objects and crowds out the
+    task it was doing. It only bites on a long range, so it never showed up in
+    testing — which is exactly why it is pinned here.
+
+    The dangerous half of the fix is the cure, not the disease: bounding a
+    series by averaging is only safe while high/low/average still come from
+    every raw sample. A peak computed from the points that survived would be
+    wrong in the one case anyone reads metrics for.
+    """
+
+    START = "2026-08-01T00:00:00Z"
+
+    @staticmethod
+    def _series(samples: list[dict]) -> dict:
+        return {"metrics(projectId:": {"metrics": [{
+            "measurement": "CPU_USAGE",
+            "tags": {"deploymentId": "dep-1"},
+            "values": samples,
+        }]}}
+
+    @classmethod
+    def _flat_day(cls, spike_at: int | None = None, spike: float = 95.0) -> list[dict]:
+        """A day of 10-second samples — 8640 of them, as Railway really answers."""
+        base = 1785542400  # 2026-08-01T00:00:00Z, matching START
+        return [{"ts": base + i * 10,
+                 "value": spike if i == spike_at else 1.0}
+                for i in range(8640)]
+
+    async def _metrics(self, samples: list[dict], end: str) -> dict:
+        self.install(self._series(samples))
+        result = json.loads(await _text(server.mcp.call_tool("get_metrics", {
+            "project_id": "p1", "environment_id": "e1", "service_id": "s1",
+            "start_date": self.START, "end_date": end,
+        })))
+        return result[0]
+
+    async def test_a_wide_range_is_bounded_and_says_it_was_summarised(self):
+        """A day must not come back as 8640 points, and must not come back as a
+        silent subset either: a caller reasoning about a partial window while
+        believing it holds the whole one is worse than a big answer."""
+        raw = self._flat_day()
+        series = await self._metrics(raw, "2026-08-02T00:00:00Z")
+
+        self.assertLess(len(series["values"]), len(raw) // 10,
+                        "a day of samples came back essentially unbounded")
+        self.assertLessEqual(len(series["values"]), 360)
+        self.assertEqual(300, series["sampleIntervalSeconds"],
+                         "a day should land on 5-minute points")
+        self.assertIn("not truncated", series["note"],
+                      "the response does not tell the caller it was summarised")
+        self.assertIn("300", series["note"], "the interval used is not stated")
+
+    async def test_a_narrow_range_is_returned_exactly_as_measured(self):
+        """Half an hour is already small. Condensing it would cost fidelity for
+        no benefit, so the ordinary short call must behave as it always has."""
+        raw = self._flat_day()[:180]  # 30 minutes at 10 s
+        series = await self._metrics(raw, "2026-08-01T00:30:00Z")
+
+        self.assertEqual(raw, series["values"],
+                        "a short range was altered — it must pass through")
+        self.assertNotIn("note", series)
+        self.assertNotIn("sampleIntervalSeconds", series)
+
+    async def test_a_spike_survives_being_condensed(self):
+        """The defect the fix could introduce. One sample in a day is 95%; every
+        neighbour is 1%. Averaged into a 5-minute point it all but vanishes, so
+        the high must be read off the raw samples or the answer is a lie in the
+        only case that matters."""
+        spike_index = 4000
+        raw = self._flat_day(spike_at=spike_index)
+        series = await self._metrics(raw, "2026-08-02T00:00:00Z")
+
+        self.assertEqual(95.0, series["summary"]["high"],
+                         "the peak was computed from the surviving points, not "
+                         "from every sample — a brief spike is invisible")
+        self.assertEqual(raw[spike_index]["ts"], series["summary"]["highTs"])
+        self.assertEqual(1.0, series["summary"]["low"])
+        self.assertEqual(len(raw), series["summary"]["samples"],
+                         "the summary did not cover the full range")
+        self.assertAlmostEqual(
+            (1.0 * (len(raw) - 1) + 95.0) / len(raw), series["summary"]["average"],
+            places=9, msg="the average is not the average of the full range")
+
+        peak_of_returned = max(v["value"] for v in series["values"])
+        self.assertLess(peak_of_returned, 95.0,
+                        "the spike happens to survive condensing here, so this "
+                        "test would pass even with a summary computed from the "
+                        "returned points — pick a spike that gets averaged away")
+
+    async def test_the_interval_is_chosen_from_the_range_asked_for(self):
+        """The bound is a function of the window, not a fixed number of points,
+        so the answer stays legible as the range grows instead of silently
+        changing resolution to whatever fills a quota."""
+        self.assertEqual(10, server._sample_interval_for(3600))       # an hour
+        self.assertEqual(300, server._sample_interval_for(86400))     # a day
+        self.assertEqual(1800, server._sample_interval_for(604800))   # a week
+        self.assertEqual(21600, server._sample_interval_for(2592000))  # a month
+        self.assertGreater(server._sample_interval_for(86400 * 4000), 86400,
+                           "a decade-long range must still be bounded")
+
+
 async def _text(call) -> str:
     """Pull the tool's string return value out of whatever call_tool answers.
 
