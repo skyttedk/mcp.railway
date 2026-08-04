@@ -871,6 +871,113 @@ class ListProjectsFailureTest(_StubbedServer):
         self.assertIn("***", leaked)
 
 
+class ListProjectsPinnedProjectTest(_StubbedServer):
+    """The failure reason above only reaches a caller who got nothing back.
+
+    With RAILWAY_PROJECT_ID set, the pinned project satisfies the request and
+    the recorded failures were dropped — so a caller could not tell "the
+    account holds one project" from "everything failed and one id was
+    configured". An expiring token then goes unnoticed for as long as that one
+    project keeps answering whoever asks, and the first sign of trouble turns
+    up somewhere unrelated.
+
+    The rule these tests hold in place: keep giving the usable answer, and say
+    beside it that the wider lookup failed.
+    """
+
+    PINNED = "proj-pinned-id"
+
+    def setUp(self):
+        original = server.DEFAULT_PROJECT
+        server.DEFAULT_PROJECT = self.PINNED
+        self.addCleanup(setattr, server, "DEFAULT_PROJECT", original)
+
+    @staticmethod
+    def _http(status: int) -> requests.exceptions.HTTPError:
+        response = requests.Response()
+        response.status_code = status
+        return requests.exceptions.HTTPError(f"{status} Client Error", response=response)
+
+    def _all_fail(self, exc: Exception) -> None:
+        self.install({"me { workspaces": exc, "query { projects": exc})
+
+    async def _projects(self) -> list:
+        return json.loads(await _text(server.mcp.call_tool("list_projects", {})))
+
+    async def test_the_pinned_project_still_comes_back_when_the_lookup_failed(self):
+        """The half that must NOT change. This passed before the warning was
+        added and has to keep passing: a caller who got a working answer
+        yesterday still gets one, in the same shape — a list, one project, its
+        id intact. Adding a diagnosis must not cost anyone their result.
+        """
+        self._all_fail(self._http(401))
+
+        result = await self._projects()
+
+        self.assertIsInstance(result, list, "the answer stopped being a list of projects")
+        self.assertEqual(1, len(result), "the pinned project gained or lost company")
+        self.assertEqual(self.PINNED, result[0]["id"], "the usable answer was dropped")
+        self.assertIn("RAILWAY_PROJECT_ID", result[0]["name"])
+
+    async def test_the_pinned_project_says_the_wider_lookup_failed_and_why(self):
+        """The defect: one project came back and the 401 behind it vanished."""
+        self._all_fail(self._http(401))
+
+        result = await self._projects()
+
+        self.assertIn("warning", result[0],
+                      "the lookup failed and the answer said nothing about it — "
+                      "that is the whole defect")
+        self.assertIn("refused", result[0]["warning"], "the reason was thrown away")
+        self.assertIn("401", result[0]["warning"])
+        self.assertTrue(any("401" in a for a in result[0]["attempts"]),
+                        "every attempt's reason should still be readable")
+
+    async def test_an_unreachable_railway_reads_differently_from_a_refusal(self):
+        """Same wording as the no-project-id answer, because it is the same
+        sentence — a caller should not have to learn two of them."""
+        self._all_fail(requests.exceptions.ConnectionError("no route"))
+
+        result = await self._projects()
+
+        self.assertIn("Could not list projects", result[0]["warning"])
+        self.assertIn("unreachable", result[0]["warning"])
+        self.assertNotIn("refused", result[0]["warning"])
+
+    async def test_a_quiet_account_gets_no_warning(self):
+        """The other half: when every query succeeded and simply had nothing to
+        return, there is no failure to report and inventing one would train
+        readers to ignore the field. Passes before and after — it guards the
+        new code against crying wolf, it does not describe a past bug.
+        """
+        self.install({"me { workspaces": {"me": {"workspaces": []}},
+                      "query { projects": {"projects": {"edges": []}}})
+
+        result = await self._projects()
+
+        self.assertEqual(self.PINNED, result[0]["id"])
+        self.assertNotIn("warning", result[0], "nothing failed, so nothing to warn about")
+        self.assertNotIn("attempts", result[0])
+
+    async def test_the_warning_cannot_carry_the_token(self):
+        """The warning is new text handed to callers, and it is built from
+        Railway's own words — which is exactly where a credential comes back at
+        you. It goes through _why, so it is redacted; this pins that it stays
+        that way now the text has a second way out of the server.
+        """
+        original = server.TOKEN
+        server.TOKEN = "super-secret-token"
+        self.addCleanup(setattr, server, "TOKEN", original)
+        echoed = {"errors": [{"message": "bad auth: Bearer super-secret-token"}]}
+        self.install({"me { workspaces": echoed, "query { projects": echoed})
+
+        result = await self._projects()
+
+        self.assertIn("warning", result[0])
+        self.assertNotIn("super-secret-token", json.dumps(result))
+        self.assertIn("***", result[0]["warning"])
+
+
 class MetricsSizeTest(_StubbedServer):
     """get_metrics used to return every sample Railway held, unbounded.
 

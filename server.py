@@ -124,6 +124,16 @@ def _why(exc: Exception) -> str:
         msg = msg.replace(TOKEN, "***")
     return f"Railway rejected the query: {msg[:200]}"
 
+def _could_not_list(failures: list[str]) -> str:
+    """The one sentence saying the project lookup failed, and why.
+
+    Written once because it is now said in two places: as the whole answer when
+    nothing came back at all, and alongside a pinned project when one did. Two
+    hand-written copies would drift apart, and a caller that learned to
+    recognise one wording would not recognise the other.
+    """
+    return f"Could not list projects — {failures[0]}"
+
 async def _query(query: str, variables: dict | None = None) -> dict:
     """Run one GraphQL call without blocking the event loop.
 
@@ -154,7 +164,13 @@ async def whoami() -> str:
 
 @mcp.tool()
 async def list_projects() -> str:
-    """List all Railway projects the token can access."""
+    """List all Railway projects the token can access.
+
+    When the lookup fails but RAILWAY_PROJECT_ID is set, that one project is
+    still returned — carrying a `warning` naming what went wrong, so a dead
+    token or a Railway outage stays visible instead of being masked by the
+    pinned id.
+    """
     # One round trip: workspaces AND their projects in a single query.
     #
     # This used to start with `query { projects }` and, when that came back
@@ -214,10 +230,24 @@ async def list_projects() -> str:
     # configuration problem that does not exist, while an outage or an expired
     # token never surfaces anywhere. The config message below is correct only
     # when every query succeeded and simply had nothing to return.
+    #
+    # A pinned RAILWAY_PROJECT_ID is a usable answer and stays the answer — the
+    # caller gets a project rather than an error, which is the right trade. But
+    # returning it alone says nothing about HOW we got here: one pinned project
+    # satisfies whoever asked just as well whether the wider lookup found
+    # nothing or died trying, so an expiring token or a Railway outage can sit
+    # unnoticed for as long as that one id keeps being enough. The note rides
+    # along on the project itself, which keeps the answer a list of projects —
+    # a second element would look like a project that does not exist, and an
+    # object would break every caller that iterates this.
     if DEFAULT_PROJECT:
-        return json.dumps([{"id": DEFAULT_PROJECT, "name": "(from RAILWAY_PROJECT_ID)"}])
+        pinned = {"id": DEFAULT_PROJECT, "name": "(from RAILWAY_PROJECT_ID)"}
+        if failures:
+            pinned["warning"] = _could_not_list(failures)
+            pinned["attempts"] = failures
+        return json.dumps([pinned])
     if failures:
-        return json.dumps({"error": f"Could not list projects — {failures[0]}",
+        return json.dumps({"error": _could_not_list(failures),
                            "attempts": failures})
     return json.dumps({"error": "Token cannot list projects. Set RAILWAY_PROJECT_ID or use a less-scoped token.",
                        "workspaces": [{"id": w["id"], "name": w["name"]} for w in workspaces]})
