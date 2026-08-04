@@ -8,6 +8,7 @@ from __future__ import annotations
 import os
 import json
 import requests
+from anyio import to_thread
 from mcp.server.fastmcp import FastMCP
 
 TOKEN = os.getenv("RAILWAY_API_TOKEN", "")
@@ -20,7 +21,7 @@ def _pid(project_id: str = "") -> str:
     """Return project_id or default from env."""
     return project_id or DEFAULT_PROJECT
 
-def _query(query: str, variables: dict | None = None) -> dict:
+def _query_sync(query: str, variables: dict | None = None) -> dict:
     r = requests.post(API, json={"query": query, "variables": variables or {}},
                        headers={"Authorization": f"Bearer {TOKEN}"}, timeout=30)
     r.raise_for_status()
@@ -29,35 +30,50 @@ def _query(query: str, variables: dict | None = None) -> dict:
         raise RuntimeError(data["errors"][0]["message"])
     return data["data"]
 
+async def _query(query: str, variables: dict | None = None) -> dict:
+    """Run one GraphQL call without blocking the event loop.
+
+    requests is blocking, and the SDK calls a plain `def` tool directly on the
+    event loop (func_metadata.py: `return fn(**args)` with no thread offload).
+    A single slow Railway response would therefore stall the whole service for
+    up to the 30 s timeout — including the streamable-http session traffic the
+    gateway depends on — so it drops the backend and it looks like an outage
+    with no error to explain it. Hence: every tool is `async def` and awaits
+    this, which parks the request in a worker thread and leaves the loop free
+    to serve other calls. Keep both halves of that pair; a plain `def` tool
+    reintroduces the stall even though it still works.
+    """
+    return await to_thread.run_sync(_query_sync, query, variables)
+
 # ── tools ──────────────────────────────────────────────────────────
 
 @mcp.tool()
-def whoami() -> str:
+async def whoami() -> str:
     """Return the authenticated Railway user plus the workspaces the token can
     create projects in.
 
     Each workspace is {id, name}; pass a workspace id to create_project's
     workspace_id (Railway's ProjectCreateInput requires a workspaceId — there is
     no implicit "personal" default at the API level)."""
-    data = _query("query { me { email name workspaces { id name } } }")
+    data = await _query("query { me { email name workspaces { id name } } }")
     return json.dumps(data["me"])
 
 @mcp.tool()
-def list_projects() -> str:
+async def list_projects() -> str:
     """List all Railway projects the token can access."""
     # Try direct projects query
-    data = _query("query { projects { edges { node { id name } } } }")
+    data = await _query("query { projects { edges { node { id name } } } }")
     projects = [e["node"] for e in data["projects"]["edges"]]
     if projects:
         return json.dumps(projects)
 
     # Fallback: try via workspaces
     try:
-        me = _query("query { me { workspaces { id name } } }")
+        me = await _query("query { me { workspaces { id name } } }")
         result = []
         for ws in me["me"]["workspaces"]:
             try:
-                wp = _query("""query($wid: String!) {
+                wp = await _query("""query($wid: String!) {
                   workspace(workspaceId: $wid) { projects { edges { node { id name } } } }
                 }""", {"wid": ws["id"]})
                 for e in wp["workspace"]["projects"]["edges"]:
@@ -75,7 +91,7 @@ def list_projects() -> str:
     return json.dumps({"error": "Token cannot list projects. Set RAILWAY_PROJECT_ID or use a less-scoped token.", "workspaces": me.get("me", {}).get("workspaces", []) if 'me' in dir() else []})
 
 @mcp.tool()
-def create_project(name: str, description: str = "", workspace_id: str = "") -> str:
+async def create_project(name: str, description: str = "", workspace_id: str = "") -> str:
     """Create a new Railway project.
 
     name is required. description is optional. workspace_id is the target
@@ -89,7 +105,7 @@ def create_project(name: str, description: str = "", workspace_id: str = "") -> 
     """
     wid = workspace_id
     if not wid:
-        workspaces = _query("query { me { workspaces { id name } } }")["me"]["workspaces"]
+        workspaces = await _query("query { me { workspaces { id name } } }")["me"]["workspaces"]
         if len(workspaces) == 1:
             wid = workspaces[0]["id"]
         elif not workspaces:
@@ -100,7 +116,7 @@ def create_project(name: str, description: str = "", workspace_id: str = "") -> 
     inp: dict = {"name": name, "workspaceId": wid}
     if description:
         inp["description"] = description
-    data = _query("""mutation($input: ProjectCreateInput!) {
+    data = await _query("""mutation($input: ProjectCreateInput!) {
       projectCreate(input: $input) {
         id
         name
@@ -112,7 +128,7 @@ def create_project(name: str, description: str = "", workspace_id: str = "") -> 
     return json.dumps(proj)
 
 @mcp.tool()
-def list_services(project_id: str = "") -> str:
+async def list_services(project_id: str = "") -> str:
     """List services in a Railway project (uses RAILWAY_PROJECT_ID if empty).
 
     Each service includes its per-environment `instances` with the region
@@ -122,7 +138,7 @@ def list_services(project_id: str = "") -> str:
     pid = _pid(project_id)
     if not pid:
         return json.dumps({"error": "No project_id provided and RAILWAY_PROJECT_ID not set"})
-    data = _query("""query($id: String!) {
+    data = await _query("""query($id: String!) {
       project(id: $id) { services { edges { node {
         id
         name
@@ -138,25 +154,25 @@ def list_services(project_id: str = "") -> str:
 
 
 @mcp.tool()
-def list_regions() -> str:
+async def list_regions() -> str:
     """List the deploy regions available to this Railway account.
 
     Returns [{id, name, location, country, region}]. Pass the `name` value
     (e.g. "europe-west4-drams3a", "us-west2") to set_region or create_volume —
     NOT the short `id` ("ams", "sfo"), which is just the metro code."""
-    data = _query("query { regions { id name location country region } }")
+    data = await _query("query { regions { id name location country region } }")
     return json.dumps(data["regions"])
 
 
 @mcp.tool()
-def get_service_instance(environment_id: str, service_id: str) -> str:
+async def get_service_instance(environment_id: str, service_id: str) -> str:
     """Get one service's per-environment deploy config: region, replicas,
     builder, commands, healthcheck, sleep/cron settings.
 
     `region` is the per-service override; null means the service inherits
     Railway's default region (currently US West / us-west2 for new services —
     confirm with list_regions). Change it with set_region."""
-    data = _query("""query($sid: String!, $eid: String!) {
+    data = await _query("""query($sid: String!, $eid: String!) {
       serviceInstance(serviceId: $sid, environmentId: $eid) {
         serviceId
         serviceName
@@ -180,7 +196,7 @@ def get_service_instance(environment_id: str, service_id: str) -> str:
 
 
 @mcp.tool()
-def set_region(environment_id: str, service_id: str, region: str,
+async def set_region(environment_id: str, service_id: str, region: str,
                redeploy: bool = False) -> str:
     """Set the deploy region for a service in one environment.
 
@@ -190,13 +206,13 @@ def set_region(environment_id: str, service_id: str, region: str,
     trigger one immediately. NB: attached volumes do NOT move with the
     service; a volume stays in its own region, so check list_volumes before
     moving a service with persistent storage."""
-    _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
+    await _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
       serviceInstanceUpdate(serviceId: $sid, environmentId: $eid, input: $input)
     }""", {"sid": service_id, "eid": environment_id, "input": {"region": region}})
     result: dict = {"serviceId": service_id, "environmentId": environment_id,
                     "region": region, "updated": True, "redeployed": False}
     if redeploy:
-        _query("""mutation($sid: String!, $eid: String!) {
+        await _query("""mutation($sid: String!, $eid: String!) {
           serviceInstanceRedeploy(serviceId: $sid, environmentId: $eid)
         }""", {"sid": service_id, "eid": environment_id})
         result["redeployed"] = True
@@ -205,14 +221,14 @@ def set_region(environment_id: str, service_id: str, region: str,
     return json.dumps(result)
 
 @mcp.tool()
-def set_start_command(environment_id: str, service_id: str, start_command: str,
+async def set_start_command(environment_id: str, service_id: str, start_command: str,
                       redeploy: bool = False) -> str:
     """Set or clear the custom start command for a service in one environment.
 
     Pass an empty string to clear the override so the service falls back to
     its Dockerfile CMD / builder default. The change only takes effect on the
     next deploy — pass redeploy=true to trigger one immediately."""
-    _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
+    await _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
       serviceInstanceUpdate(serviceId: $sid, environmentId: $eid, input: $input)
     }""", {"sid": service_id, "eid": environment_id,
            "input": {"startCommand": start_command or None}})
@@ -220,7 +236,7 @@ def set_start_command(environment_id: str, service_id: str, start_command: str,
                     "startCommand": start_command or None, "updated": True,
                     "redeployed": False}
     if redeploy:
-        _query("""mutation($sid: String!, $eid: String!) {
+        await _query("""mutation($sid: String!, $eid: String!) {
           serviceInstanceRedeploy(serviceId: $sid, environmentId: $eid)
         }""", {"sid": service_id, "eid": environment_id})
         result["redeployed"] = True
@@ -230,9 +246,9 @@ def set_start_command(environment_id: str, service_id: str, start_command: str,
 
 
 @mcp.tool()
-def create_service(project_id: str, environment_id: str, name: str) -> str:
+async def create_service(project_id: str, environment_id: str, name: str) -> str:
     """Create a new Railway service inside a project/environment."""
-    data = _query("""mutation($input: ServiceCreateInput!) {
+    data = await _query("""mutation($input: ServiceCreateInput!) {
       serviceCreate(input: $input) {
         id
         name
@@ -245,9 +261,9 @@ def create_service(project_id: str, environment_id: str, name: str) -> str:
     return json.dumps(data["serviceCreate"])
 
 @mcp.tool()
-def connect_service(service_id: str, repo: str, branch: str = "master") -> str:
+async def connect_service(service_id: str, repo: str, branch: str = "master") -> str:
     """Connect a Railway service to a GitHub repo/branch for auto deploys."""
-    data = _query("""mutation($id: String!, $input: ServiceConnectInput!) {
+    data = await _query("""mutation($id: String!, $input: ServiceConnectInput!) {
       serviceConnect(id: $id, input: $input) {
         id
         name
@@ -259,16 +275,16 @@ def connect_service(service_id: str, repo: str, branch: str = "master") -> str:
     return json.dumps(data["serviceConnect"])
 
 @mcp.tool()
-def list_environments(project_id: str) -> str:
+async def list_environments(project_id: str) -> str:
     """List environments in a Railway project."""
-    data = _query("""query($id: String!) {
+    data = await _query("""query($id: String!) {
       project(id: $id) { environments { edges { node { id name } } } }
     }""", {"id": project_id})
     envs = [e["node"] for e in data["project"]["environments"]["edges"]]
     return json.dumps(envs)
 
 @mcp.tool()
-def list_variables(project_id: str, environment_id: str, service_id: str = "") -> str:
+async def list_variables(project_id: str, environment_id: str, service_id: str = "") -> str:
     """List which variables are set on a project/environment/service.
 
     Values are NEVER returned — only names plus safe metadata, so the response
@@ -280,7 +296,7 @@ def list_variables(project_id: str, environment_id: str, service_id: str = "") -
     expected value, use check_variable. There is no mode that returns raw
     values; read them in the Railway dashboard if a human truly needs one."""
     import hashlib
-    data = _query("""query($pid: String!, $eid: String!, $sid: String!) {
+    data = await _query("""query($pid: String!, $eid: String!, $sid: String!) {
       variables(projectId: $pid, environmentId: $eid, serviceId: $sid)
     }""", {"pid": project_id, "eid": environment_id, "sid": service_id})
     variables = data["variables"] or {}
@@ -294,7 +310,7 @@ def list_variables(project_id: str, environment_id: str, service_id: str = "") -
     ])
 
 @mcp.tool()
-def check_variable(project_id: str, environment_id: str,
+async def check_variable(project_id: str, environment_id: str,
                    service_id: str, key: str) -> str:
     """Check whether a single env var is configured on a Railway service.
 
@@ -304,7 +320,7 @@ def check_variable(project_id: str, environment_id: str,
     confirm a specific expected value without moving the value itself. Use when
     you only need to verify a key is set, rather than reading all variables."""
     import hashlib
-    data = _query("""query($pid: String!, $eid: String!, $sid: String!) {
+    data = await _query("""query($pid: String!, $eid: String!, $sid: String!) {
       variables(projectId: $pid, environmentId: $eid, serviceId: $sid)
     }""", {"pid": project_id, "eid": environment_id, "sid": service_id})
     variables = data["variables"] or {}
@@ -320,10 +336,10 @@ def check_variable(project_id: str, environment_id: str,
     })
 
 @mcp.tool()
-def set_variables(project_id: str, environment_id: str,
+async def set_variables(project_id: str, environment_id: str,
                   service_id: str, variables: dict[str, str]) -> str:
     """Set variables on a Railway service."""
-    result = _query("""mutation($input: VariableCollectionUpsertInput!) {
+    result = await _query("""mutation($input: VariableCollectionUpsertInput!) {
       variableCollectionUpsert(input: $input)
     }""", {"input": {
         "projectId": project_id, "environmentId": environment_id,
@@ -332,7 +348,7 @@ def set_variables(project_id: str, environment_id: str,
     return json.dumps(result)
 
 @mcp.tool()
-def get_logs(project_id: str, environment_id: str, service_id: str,
+async def get_logs(project_id: str, environment_id: str, service_id: str,
              limit: int = 50) -> str:
     """Get recent deployment logs for a service.
 
@@ -340,7 +356,7 @@ def get_logs(project_id: str, environment_id: str, service_id: str,
     logs are keyed by deploymentId. This looks up the most recent deployment for
     the given project/environment/service, then fetches that deployment's logs.
     """
-    deployments = _query("""query($input: DeploymentListInput!) {
+    deployments = await _query("""query($input: DeploymentListInput!) {
       deployments(input: $input, first: 5) {
         edges { node { id createdAt status } }
       }
@@ -352,7 +368,7 @@ def get_logs(project_id: str, environment_id: str, service_id: str,
         return json.dumps({"error": "No deployments found for this project/environment/service"})
     latest = sorted((e["node"] for e in edges), key=lambda d: d["createdAt"], reverse=True)[0]
 
-    data = _query("""query($did: String!, $limit: Int!) {
+    data = await _query("""query($did: String!, $limit: Int!) {
       deploymentLogs(deploymentId: $did, limit: $limit) {
         timestamp message
       }
@@ -361,7 +377,7 @@ def get_logs(project_id: str, environment_id: str, service_id: str,
                        "logs": data.get("deploymentLogs", [])})
 
 @mcp.tool()
-def get_metrics(project_id: str, environment_id: str, service_id: str,
+async def get_metrics(project_id: str, environment_id: str, service_id: str,
                 start_date: str, end_date: str = "",
                 measurements: list[str] | None = None,
                 sample_rate_seconds: int = 0) -> str:
@@ -376,7 +392,7 @@ def get_metrics(project_id: str, environment_id: str, service_id: str,
     deployment's window when others ran in the same project/environment/service
     during the requested range. Each value is {ts, value} (ts = unix seconds).
     """
-    data = _query("""query($pid: String!, $eid: String!, $sid: String!, $start: DateTime!,
+    data = await _query("""query($pid: String!, $eid: String!, $sid: String!, $start: DateTime!,
                           $end: DateTime, $measurements: [MetricMeasurement!]!, $rate: Int) {
       metrics(projectId: $pid, environmentId: $eid, serviceId: $sid,
               startDate: $start, endDate: $end, measurements: $measurements,
@@ -394,9 +410,9 @@ def get_metrics(project_id: str, environment_id: str, service_id: str,
     return json.dumps(data.get("metrics", []))
 
 @mcp.tool()
-def deploy(project_id: str, environment_id: str, service_id: str) -> str:
+async def deploy(project_id: str, environment_id: str, service_id: str) -> str:
     """Trigger a deploy for a service (via restart)."""
-    data = _query("""mutation($sid: String!) {
+    data = await _query("""mutation($sid: String!) {
       deploymentRestart(id: $sid)
     }""", {"sid": service_id})
     return json.dumps(data)
@@ -405,14 +421,14 @@ def deploy(project_id: str, environment_id: str, service_id: str) -> str:
 # ── domain tools ────────────────────────────────────────────────────
 
 @mcp.tool()
-def list_service_domains(project_id: str, environment_id: str,
+async def list_service_domains(project_id: str, environment_id: str,
                          service_id: str) -> str:
     """List all domains (service + custom) for a Railway service.
 
     For custom domains, includes DNS verification info (TXT host/token),
     verification status, DNS records (CNAME target etc.), and SSL cert status.
     """
-    data = _query("""query($pid: String!, $eid: String!, $sid: String!) {
+    data = await _query("""query($pid: String!, $eid: String!, $sid: String!) {
       domains(projectId: $pid, environmentId: $eid, serviceId: $sid) {
         serviceDomains { id domain targetPort syncStatus createdAt }
         customDomains {
@@ -448,7 +464,7 @@ def list_service_domains(project_id: str, environment_id: str,
 
 
 @mcp.tool()
-def get_custom_domain_details(project_id: str, environment_id: str,
+async def get_custom_domain_details(project_id: str, environment_id: str,
                               service_id: str, domain: str) -> str:
     """Get full DNS details for a specific custom domain, including
     verification TXT records, CNAME targets, and SSL certificate status.
@@ -456,7 +472,7 @@ def get_custom_domain_details(project_id: str, environment_id: str,
     Use this after create_custom_domain to get the verification values
     you need to set at your DNS provider (e.g. Simply.com).
     """
-    data = _query("""query($pid: String!, $eid: String!, $sid: String!) {
+    data = await _query("""query($pid: String!, $eid: String!, $sid: String!) {
       domains(projectId: $pid, environmentId: $eid, serviceId: $sid) {
         customDomains {
           id
@@ -500,7 +516,7 @@ def get_custom_domain_details(project_id: str, environment_id: str,
 
 
 @mcp.tool()
-def create_service_domain(project_id: str, environment_id: str,
+async def create_service_domain(project_id: str, environment_id: str,
                           service_id: str, target_port: int = 0) -> str:
     """Create a new Railway-generated domain for a service.
     Optionally set target_port (omit or set 0 for auto)."""
@@ -510,7 +526,7 @@ def create_service_domain(project_id: str, environment_id: str,
     }
     if target_port and target_port > 0:
         inp["targetPort"] = target_port
-    data = _query("""mutation($input: ServiceDomainCreateInput!) {
+    data = await _query("""mutation($input: ServiceDomainCreateInput!) {
       serviceDomainCreate(input: $input) {
         domain
         id
@@ -522,7 +538,7 @@ def create_service_domain(project_id: str, environment_id: str,
 
 
 @mcp.tool()
-def create_custom_domain(project_id: str, environment_id: str,
+async def create_custom_domain(project_id: str, environment_id: str,
                          service_id: str, domain: str,
                          target_port: int = 0) -> str:
     """Add a custom domain (e.g. 'api.example.com') to a Railway service.
@@ -535,7 +551,7 @@ def create_custom_domain(project_id: str, environment_id: str,
     }
     if target_port and target_port > 0:
         inp["targetPort"] = target_port
-    data = _query("""mutation($input: CustomDomainCreateInput!) {
+    data = await _query("""mutation($input: CustomDomainCreateInput!) {
       customDomainCreate(input: $input) {
         id
         domain
@@ -547,16 +563,16 @@ def create_custom_domain(project_id: str, environment_id: str,
 
 
 @mcp.tool()
-def delete_service_domain(domain_id: str) -> str:
+async def delete_service_domain(domain_id: str) -> str:
     """Delete a domain from a service (pass the domain ID from list_service_domains)."""
-    data = _query("""mutation($id: String!) {
+    data = await _query("""mutation($id: String!) {
       serviceDomainDelete(id: $id)
     }""", {"id": domain_id})
     return json.dumps(data)
 
 
 @mcp.tool()
-def update_service_domain(environment_id: str, service_id: str,
+async def update_service_domain(environment_id: str, service_id: str,
                           service_domain_id: str, domain: str,
                           target_port: int = 0) -> str:
     """Update a service domain (e.g. change target port).
@@ -569,7 +585,7 @@ def update_service_domain(environment_id: str, service_id: str,
     }
     if target_port and target_port > 0:
         inp["targetPort"] = target_port
-    data = _query("""mutation($input: ServiceDomainUpdateInput!) {
+    data = await _query("""mutation($input: ServiceDomainUpdateInput!) {
       serviceDomainUpdate(input: $input) {
         id
         domain
@@ -581,7 +597,7 @@ def update_service_domain(environment_id: str, service_id: str,
 
 
 @mcp.tool()
-def list_volumes(project_id: str = "") -> str:
+async def list_volumes(project_id: str = "") -> str:
     """List persistent volumes in a project (uses RAILWAY_PROJECT_ID if empty).
 
     A volume is project-scoped; its per-environment attachments are the
@@ -591,7 +607,7 @@ def list_volumes(project_id: str = "") -> str:
     pid = _pid(project_id)
     if not pid:
         return json.dumps({"error": "No project_id provided and RAILWAY_PROJECT_ID not set"})
-    data = _query("""query($id: String!) {
+    data = await _query("""query($id: String!) {
       project(id: $id) { volumes { edges { node {
         id
         name
@@ -618,7 +634,7 @@ def list_volumes(project_id: str = "") -> str:
 
 
 @mcp.tool()
-def create_volume(project_id: str, environment_id: str, service_id: str,
+async def create_volume(project_id: str, environment_id: str, service_id: str,
                   mount_path: str, region: str = "") -> str:
     """Create a persistent volume and attach it to a service at mount_path.
 
@@ -635,7 +651,7 @@ def create_volume(project_id: str, environment_id: str, service_id: str,
     }
     if region:
         inp["region"] = region
-    data = _query("""mutation($input: VolumeCreateInput!) {
+    data = await _query("""mutation($input: VolumeCreateInput!) {
       volumeCreate(input: $input) {
         id
         name
@@ -646,7 +662,7 @@ def create_volume(project_id: str, environment_id: str, service_id: str,
 
 
 @mcp.tool()
-def update_volume_mount(volume_id: str, environment_id: str = "",
+async def update_volume_mount(volume_id: str, environment_id: str = "",
                         mount_path: str = "", service_id: str = "") -> str:
     """Re-mount an existing volume: change its mount path and/or move it to a
     different service, for one environment.
@@ -665,7 +681,7 @@ def update_volume_mount(volume_id: str, environment_id: str = "",
     variables: dict = {"volumeId": volume_id, "input": inp}
     if environment_id:
         variables["environmentId"] = environment_id
-    data = _query("""mutation($volumeId: String!, $environmentId: String,
+    data = await _query("""mutation($volumeId: String!, $environmentId: String,
                              $input: VolumeInstanceUpdateInput!) {
       volumeInstanceUpdate(volumeId: $volumeId, environmentId: $environmentId,
                            input: $input)
@@ -674,12 +690,12 @@ def update_volume_mount(volume_id: str, environment_id: str = "",
 
 
 @mcp.tool()
-def delete_volume(volume_id: str) -> str:
+async def delete_volume(volume_id: str) -> str:
     """Delete a volume and permanently destroy its data.
 
     volume_id is the parent volume id from list_volumes. This removes the volume
     in every environment it is attached to and cannot be undone."""
-    data = _query("""mutation($volumeId: String!) {
+    data = await _query("""mutation($volumeId: String!) {
       volumeDelete(volumeId: $volumeId)
     }""", {"volumeId": volume_id})
     return json.dumps(data)
