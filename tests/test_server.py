@@ -977,6 +977,193 @@ class MetricsSizeTest(_StubbedServer):
                            "a decade-long range must still be bounded")
 
 
+class LogProvenanceTest(_StubbedServer):
+    """Logs must say which deployment they came from, and shout when that is
+    not the deployment serving traffic.
+
+    The failure is silent and arrives at the worst moment: a deploy has just
+    failed, someone asks for the logs to find out why the service is misbehaving,
+    and reads the failed build's output while the service is still running the
+    previous, working version. Both facts were in the old answer — the status
+    was right there — but nothing distinguished them, so the reader compares
+    nothing and spends half an hour debugging a version no request reaches."""
+
+    # A failed build on top of a working release: dep-new is the NEWEST
+    # deployment, dep-live is the one actually holding the container.
+    _FAILED_ON_TOP = {
+        "deployments(input:": {"deployments": {"edges": [
+            {"node": {"id": "dep-live", "createdAt": "2026-08-04T10:00:00Z",
+                      "status": "SUCCESS", "deploymentStopped": False}},
+            {"node": {"id": "dep-new", "createdAt": "2026-08-04T12:00:00Z",
+                      "status": "FAILED", "deploymentStopped": False}},
+        ]}},
+        "deploymentLogs(deploymentId:": {"deploymentLogs": [
+            {"timestamp": "2026-08-04T12:00:01Z", "message": "build failed"}]},
+    }
+
+    _HEALTHY = {
+        "deployments(input:": {"deployments": {"edges": [
+            {"node": {"id": "dep-old", "createdAt": "2026-08-01T10:00:00Z",
+                      "status": "REMOVED", "deploymentStopped": False}},
+            {"node": {"id": "dep-live", "createdAt": "2026-08-04T10:00:00Z",
+                      "status": "SUCCESS", "deploymentStopped": False}},
+        ]}},
+        "deploymentLogs(deploymentId:": {"deploymentLogs": [
+            {"timestamp": "2026-08-04T10:00:01Z", "message": "listening on 8080"}]},
+    }
+
+    async def test_logs_from_a_failed_deployment_are_flagged(self):
+        """The whole card. The newest deployment failed, so these logs describe
+        a version nothing is running — and that must be the first thing in the
+        answer, not a status the reader is expected to cross-check."""
+        self.install(self._FAILED_ON_TOP)
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1"})))
+
+        self.assertIs(False, result["deploymentIsRunning"])
+        self.assertIn("warning", result,
+                      "a failed deployment's logs were served with no warning")
+        self.assertIn("NOT", result["warning"],
+                      "the warning must say plainly that this is not the running version")
+        self.assertIn("dep-live", result["warning"],
+                      "the warning must name the deployment that IS running")
+        self.assertEqual("dep-live", result["runningDeploymentId"])
+        self.assertEqual("SUCCESS", result["runningDeploymentStatus"])
+        self.assertEqual("warning", next(iter(result)),
+                         "the warning must lead the answer, not trail it")
+
+    async def test_running_logs_carry_no_warning(self):
+        """The other half: a caller reading healthy logs must not have to wade
+        through a caveat that does not apply. A warning that fires every time is
+        a warning nobody reads when it matters."""
+        self.install(self._HEALTHY)
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1"})))
+
+        self.assertIs(True, result["deploymentIsRunning"])
+        self.assertNotIn("warning", result)
+        self.assertNotIn("runningDeploymentId", result,
+                         "no second deployment to compare against — do not add fields")
+        self.assertEqual("dep-live", result["deploymentId"])
+
+    async def test_default_still_returns_the_newest_deployment(self):
+        """Existing callers asked for the latest deployment's logs and must keep
+        getting them: after a failed deploy its own output is the reason it
+        failed. The new provenance is added ALONGSIDE, never instead."""
+        session = self.install(self._FAILED_ON_TOP)
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1"})))
+
+        self.assertEqual("dep-new", result["deploymentId"])
+        self.assertEqual("FAILED", result["deploymentStatus"])
+        self.assertEqual([{"timestamp": "2026-08-04T12:00:01Z",
+                           "message": "build failed"}], result["logs"])
+        logs = next(c for c in session.calls if "deploymentLogs(deploymentId:" in c["query"])
+        self.assertEqual("dep-new", logs["variables"]["did"])
+
+    async def test_source_running_reads_the_deployment_serving_traffic(self):
+        """The opt-in half of the card: ask for the running one and get it,
+        without having to know which id that is."""
+        session = self.install(self._FAILED_ON_TOP)
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1", "source": "running"})))
+
+        self.assertEqual("dep-live", result["deploymentId"])
+        self.assertIs(True, result["deploymentIsRunning"])
+        self.assertNotIn("warning", result)
+        logs = next(c for c in session.calls if "deploymentLogs(deploymentId:" in c["query"])
+        self.assertEqual("dep-live", logs["variables"]["did"])
+
+    async def test_logs_are_fetched_by_deployment_id_not_service_id(self):
+        """deploymentLogs is keyed by a DEPLOYMENT id — the same trap deploy()
+        and stop_service already carry a test for. A service id there matches no
+        deployment, and Railway blames a missing deployment for a service that
+        is running perfectly well."""
+        session = self.install(self._HEALTHY)
+
+        await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1"}))
+
+        logs = next(c for c in session.calls if "deploymentLogs(deploymentId:" in c["query"])
+        self.assertEqual("dep-live", logs["variables"]["did"],
+                         "a service id was sent where a deployment id belongs")
+        self.assertNotIn("svc1", logs["variables"].values())
+
+    async def test_a_stopped_deployment_does_not_count_as_running(self):
+        """A stopped deployment keeps the status it had — Railway has no STOPPED
+        status — so SUCCESS proves nothing on its own. Read deploymentStopped
+        too, or a stopped service's logs are presented as the live version's."""
+        self.install({
+            "deployments(input:": {"deployments": {"edges": [
+                {"node": {"id": "dep-stopped", "createdAt": "2026-08-04T10:00:00Z",
+                          "status": "SUCCESS", "deploymentStopped": True}},
+            ]}},
+            "deploymentLogs(deploymentId:": {"deploymentLogs": []},
+        })
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1"})))
+
+        self.assertIs(False, result["deploymentIsRunning"])
+        self.assertIn("NO deployment", result["warning"])
+        self.assertIsNone(result["runningDeploymentId"])
+
+    async def test_source_running_refuses_when_nothing_is_running(self):
+        """Asking for the running version when there is none must say so and
+        name the statuses, rather than quietly handing back the failed build's
+        logs under the label the caller asked for."""
+        session = self.install({
+            "deployments(input:": {"deployments": {"edges": [
+                {"node": {"id": "dep-new", "createdAt": "2026-08-04T12:00:00Z",
+                          "status": "FAILED", "deploymentStopped": False}},
+            ]}},
+            "deploymentLogs(deploymentId:": {"deploymentLogs": []},
+        })
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1", "source": "running"})))
+
+        self.assertIn("No running deployment", result["error"])
+        self.assertEqual(["FAILED"], result["recentStatuses"])
+        self.assertFalse(
+            [c for c in session.calls if "deploymentLogs(deploymentId:" in c["query"]],
+            "fetched logs anyway and would have labelled them as the running version")
+
+    async def test_an_unknown_source_is_refused_by_name(self):
+        """A typo must not silently fall back to the default and answer a
+        question that was not asked."""
+        session = self.install(self._HEALTHY)
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1", "source": "live"})))
+
+        self.assertIn("live", result["error"])
+        self.assertIn("running", result["error"])
+        self.assertFalse(session.calls, "queried Railway despite a bad argument")
+
+    async def test_a_service_that_never_deployed_is_reported_as_such(self):
+        """Unchanged behaviour, kept locked: no deployments is its own answer."""
+        self.install({"deployments(input:": {"deployments": {"edges": []}}})
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1"})))
+
+        self.assertIn("No deployments found", result["error"])
+
+
 async def _text(call) -> str:
     """Pull the tool's string return value out of whatever call_tool answers.
 
