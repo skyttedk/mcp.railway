@@ -31,6 +31,14 @@ Plus one regression test per defect that prompted the suite — the `await`
 precedence bug in `create_project`'s workspace lookup, and `list_projects`
 falling back to its multi-round-trip path.
 
+And one class for stopping a service (`StopStartTest`), because the failure
+there is silent rather than loud: Railway has no STOPPED deployment status, so
+a stopped service keeps `status: SUCCESS` and is distinguishable only by
+`deploymentStopped`. The tests hold `stop_service` to reading that flag, to
+resolving a deployment id rather than passing the service id to
+`deploymentStop`, and to explaining a refusal instead of echoing the platform's
+misleading "not found".
+
 ## After an intended change to a tool's arguments
 
 The contract test fails on purpose. Confirm the change is wanted, then:
