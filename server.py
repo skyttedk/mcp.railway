@@ -718,7 +718,8 @@ async def stop_service(project_id: str, environment_id: str, service_id: str) ->
 
     This is NOT a delete. The service, its source, its variables, its domains
     and its volumes all survive untouched; only the running container goes away.
-    There is no delete tool here on purpose.
+    Prefer this over delete_service whenever the goal is to stop paying for
+    something: it costs nothing to undo, and delete_service cannot be undone.
 
     Railway's deploymentStop takes a DEPLOYMENT id, not a service id — the same
     trap deploy() documents — so this resolves the service's newest running
@@ -804,6 +805,111 @@ async def start_service(environment_id: str, service_id: str) -> str:
         })
     return json.dumps({"serviceId": service_id, "environmentId": environment_id,
                        "started": data.get("serviceInstanceRedeploy")})
+
+
+# Characters that make a name stand for a SET rather than a service: glob
+# metacharacters and the separators a caller would use to pass several names at
+# once. delete_service refuses them outright instead of resolving them, because
+# the whole risk here is a caller that meant one thing and got several — and the
+# mistake cannot be undone afterwards.
+_SET_LIKE_NAME_CHARS = "*?%,;|"
+
+
+@mcp.tool()
+async def delete_service(service_id: str = "", name: str = "",
+                   project_id: str = "") -> str:
+    """PERMANENTLY DELETE one Railway service. Irreversible — there is no undo,
+    and nothing is moved to a trash first.
+
+    What goes with it: the service in EVERY environment, all of its deployments
+    and their logs, all of its environment VARIABLES, all of its DOMAINS
+    (Railway-generated and custom) and every VOLUME attached to it together with
+    the data on it. None of that can be recovered afterwards — a domain has to be
+    created and re-verified at the DNS provider again, secrets have to be set
+    again from wherever they are kept, and volume contents are simply gone.
+
+    If the goal is to stop the service costing money, use stop_service instead:
+    it frees the container, keeps all of the above, and start_service brings the
+    service back exactly as it was.
+
+    ONE service per call, named explicitly. Pass service_id (from
+    list_services), or name together with project_id. There is deliberately no
+    way to delete several services, a whole project, or everything matching a
+    pattern. A name that matches no service — or more than one — is REFUSED and
+    nothing is deleted; it is never resolved to the closest candidate. Passing
+    both service_id and name checks them against each other and refuses a
+    mismatch. The id is looked up before the delete fires, so an id Railway
+    cannot confirm deletes nothing.
+    """
+    if not service_id and not name:
+        return json.dumps({"error": "Name the service to delete: pass service_id "
+                                    "(from list_services), or name plus project_id. "
+                                    "delete_service never chooses a service for you."})
+
+    set_like = [c for c in _SET_LIKE_NAME_CHARS if c in name]
+    if set_like:
+        return json.dumps({
+            "error": f"Refusing the name {name!r}: it contains {''.join(set_like)!r} "
+                     "and so reads as a pattern or a list of names. delete_service "
+                     "deletes exactly one service and takes one literal name — "
+                     "there is no bulk or wildcard delete. Delete them one at a "
+                     "time, each named in its own call."})
+
+    if name:
+        pid = _pid(project_id)
+        if not pid:
+            return json.dumps({
+                "error": f"Cannot look up the service named {name!r}: no project_id "
+                         "given and RAILWAY_PROJECT_ID is not set. Pass project_id, "
+                         "or pass service_id and skip the name lookup entirely."})
+        data = await _query("""query($id: String!) {
+          project(id: $id) { services { edges { node { id name } } } }
+        }""", {"id": pid})
+        services = [e["node"] for e in data["project"]["services"]["edges"]]
+        matches = [s for s in services if s["name"].strip().lower() == name.strip().lower()]
+        if not matches:
+            return json.dumps({
+                "error": f"No service named {name!r} in project {pid}. Nothing was "
+                         "deleted — delete_service refuses a name it cannot resolve "
+                         "rather than picking the nearest one.",
+                "servicesInProject": [s["name"] for s in services]})
+        if len(matches) > 1:
+            return json.dumps({
+                "error": f"The name {name!r} matches {len(matches)} services in "
+                         f"project {pid}, so it does not identify one of them. "
+                         "Nothing was deleted. Pass service_id to say which.",
+                "matched": matches})
+        target = matches[0]
+        if service_id and target["id"] != service_id:
+            return json.dumps({
+                "error": f"service_id {service_id} and name {name!r} disagree — that "
+                         f"name is service {target['id']} ({target['name']}). Nothing "
+                         "was deleted; check which of the two you meant."})
+    else:
+        try:
+            data = await _query("""query($id: String!) {
+              service(id: $id) { id name projectId }
+            }""", {"id": service_id})
+        except RuntimeError as exc:
+            return json.dumps({
+                "error": f"Railway would not confirm service {service_id}: {exc}. "
+                         "Nothing was deleted — delete_service looks the service up "
+                         "first and will not fire at an id it could not read back."})
+        target = data.get("service")
+        if not target:
+            return json.dumps({
+                "error": f"No service with id {service_id}. Nothing was deleted."})
+
+    result = await _query("""mutation($id: String!) {
+      serviceDelete(id: $id)
+    }""", {"id": target["id"]})
+    return json.dumps({
+        "serviceId": target["id"],
+        "serviceName": target["name"],
+        "deleted": result.get("serviceDelete"),
+        "note": f"Service {target['name']} ({target['id']}) was permanently deleted, "
+                "with its deployments, variables, domains and volumes. This cannot "
+                "be undone."})
 
 
 # ── domain tools ────────────────────────────────────────────────────
