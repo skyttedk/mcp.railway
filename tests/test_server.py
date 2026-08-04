@@ -1164,6 +1164,89 @@ class LogProvenanceTest(_StubbedServer):
         self.assertIn("No deployments found", result["error"])
 
 
+class RefusalWordingTest(_StubbedServer):
+    """Railway refuses anything the account cannot see with a flat "Not
+    Authorized", whether the id is mistyped, stale, someone else's or genuinely
+    off limits — it will not even admit whether the thing exists. That message
+    names the one cause that is usually NOT the problem, so an agent goes
+    auditing permissions instead of re-reading the id it sent.
+
+    The explanation is added in `_query_sync`, the single point every tool's
+    errors pass through, so all of them gain it at once. Two properties are
+    locked here: a refusal of this kind carries BOTH Railway's own words and the
+    likely cause, and a failure of any other kind is not given the explanation —
+    a confident wrong lead is worse than none.
+    """
+
+    _HINT = "not recognised on this account"
+
+    async def test_a_refusal_carries_both_railways_words_and_the_likely_cause(self):
+        """The reported case verbatim: listing services against a project the
+        token cannot read answered with a bare "Not Authorized" and nothing
+        else. Railway's wording stays — it is occasionally the real answer."""
+        self.install({"project(id:": {"errors": [{"message": "Not Authorized"}]}})
+
+        with self.assertRaises(Exception) as caught:
+            await server.mcp.call_tool("list_services", {"project_id": "p-typo"})
+
+        message = str(caught.exception)
+        self.assertIn("Not Authorized", message,
+                      "the platform's own message must survive, not be replaced")
+        self.assertIn(self._HINT, message)
+        self.assertIn("usually", message,
+                      "it must read as the likely cause, not as a verdict the "
+                      "code cannot actually reach")
+
+    async def test_a_different_failure_is_not_given_this_explanation(self):
+        """The other half. A refusal is recognised by its wording; anything else
+        is passed through untouched, because an identifier explanation bolted
+        onto an unrelated failure sends the reader somewhere there is nothing to
+        find."""
+        self.install({
+            "me { workspaces": {"errors": [{"message": "Problem processing request"}]},
+            "query { projects": {"errors": [{"message": "Problem processing request"}]},
+        })
+
+        result = json.loads(await _text(server.mcp.call_tool("list_projects", {})))
+
+        self.assertIn("Problem processing request", result["error"])
+        self.assertNotIn(self._HINT, json.dumps(result),
+                         "an unrelated failure was blamed on the identifier")
+
+    async def test_the_explanation_survives_the_tools_that_wrap_the_error(self):
+        """Several tools catch the RuntimeError and fold it into their own
+        message. Adding this at the shared boundary rather than per tool means
+        those keep working AND gain the cause — check one, so a later refactor
+        that re-raises a fresh error loses the test rather than the users."""
+        self.install({"serviceInstanceRedeploy": {
+            "errors": [{"message": "Not Authorized"}]}})
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "start_service", {"environment_id": "e1", "service_id": "svc1"})))
+
+        self.assertIn("Not Authorized", result["error"])
+        self.assertIn(self._HINT, result["error"])
+        self.assertIn("list_environments", result["hint"],
+                      "the tool's own advice must not be crowded out")
+
+    async def test_a_refusal_cannot_carry_the_token(self):
+        """An auth error is exactly the message most likely to quote the
+        credential back at us. Railway's text is now handed on by our code, so
+        it is redacted here as well as in _why."""
+        original = server.TOKEN
+        server.TOKEN = "super-secret-token"
+        self.addCleanup(setattr, server, "TOKEN", original)
+        self.install({"project(id:": {"errors": [
+            {"message": "Not Authorized: Bearer super-secret-token"}]}})
+
+        with self.assertRaises(Exception) as caught:
+            await server.mcp.call_tool("list_services", {"project_id": "p1"})
+
+        message = str(caught.exception)
+        self.assertNotIn("super-secret-token", message)
+        self.assertIn("***", message)
+
+
 async def _text(call) -> str:
     """Pull the tool's string return value out of whatever call_tool answers.
 

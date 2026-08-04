@@ -56,8 +56,47 @@ def _query_sync(query: str, variables: dict | None = None) -> dict:
     r.raise_for_status()
     data = r.json()
     if "errors" in data:
-        raise RuntimeError(data["errors"][0]["message"])
+        raise RuntimeError(_annotate_refusal(data["errors"][0]["message"]))
     return data["data"]
+
+# Railway answers a wrong id, an id belonging to someone else and a genuinely
+# unpermitted one with the same flat refusal: it decides authorisation before
+# it will admit whether the thing exists at all. A mistyped or stale id is far
+# the commonest of the three, so the bare message points at access rights when
+# the fix is almost always the identifier — and an agent then goes auditing
+# permissions instead of re-reading what it typed. These markers are how a
+# refusal of that shape is recognised; every other failure is left untouched,
+# because a wrong explanation attached to an unrelated error is its own dead
+# end.
+_REFUSAL_MARKERS = ("not authorized", "not authorised", "unauthorized",
+                    "unauthorised", "forbidden", "access denied",
+                    "permission denied")
+
+# Appended, never substituted. Railway is occasionally right — sometimes the
+# token really is missing a permission — so this says what the refusal USUALLY
+# means and leaves the platform's own words standing next to it. A message that
+# confidently blamed the identifier would just mislead in the other direction.
+# Kept short on purpose: _why truncates a rejection at 200 characters, and the
+# explanation is worth nothing if it is the half that gets cut off.
+_REFUSAL_HINT = (" — this usually means the identifier was not recognised on "
+                 "this account rather than a real permissions problem, though "
+                 "it can be either.")
+
+def _annotate_refusal(message: str) -> str:
+    """Return Railway's error message, with the likely cause added if it is a
+    refusal of the not-authorised kind.
+
+    Sits in the one place every tool's errors pass through, so all of them gain
+    the explanation at once and none of them has to repeat it. The token is
+    redacted on the way out for the same reason _why does it: this text is now
+    handed to callers by us, and Railway's message is Railway's to write.
+    """
+    if TOKEN:
+        message = message.replace(TOKEN, "***")
+    lowered = message.lower()
+    if any(marker in lowered for marker in _REFUSAL_MARKERS):
+        return message + _REFUSAL_HINT
+    return message
 
 def _why(exc: Exception) -> str:
     """One short, credential-free line explaining why a Railway query failed.
