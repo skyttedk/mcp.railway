@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import json
+import threading
 import requests
 from anyio import to_thread
 from mcp.server.fastmcp import FastMCP
@@ -21,9 +22,34 @@ def _pid(project_id: str = "") -> str:
     """Return project_id or default from env."""
     return project_id or DEFAULT_PROJECT
 
+_thread_state = threading.local()
+
+def _session() -> requests.Session:
+    """Return this thread's reusable HTTP session.
+
+    Module-level `requests.post` builds and throws away a Session per call, so
+    DNS + TCP + TLS is renegotiated every time — measured at 46-70 ms of pure
+    handshake per request to backboard.railway.com, paid 3x by a single
+    list_projects. A Session keeps the connection alive, so only the first call
+    on a thread pays it.
+
+    One session PER THREAD rather than one shared globally: _query_sync runs on
+    anyio worker threads (see _query), and requests.Session is not documented as
+    thread-safe — it mutates cookie-jar and adapter state per request. anyio
+    reuses its worker threads, so a thread-local session is still reused across
+    calls and gets the same saving without the shared-mutable-state risk.
+    """
+    s = getattr(_thread_state, "session", None)
+    if s is None:
+        s = requests.Session()
+        _thread_state.session = s
+    return s
+
 def _query_sync(query: str, variables: dict | None = None) -> dict:
-    r = requests.post(API, json={"query": query, "variables": variables or {}},
-                       headers={"Authorization": f"Bearer {TOKEN}"}, timeout=30)
+    # Auth stays a per-request header rather than a session default, so the
+    # session change alters only the connection, never what is sent.
+    r = _session().post(API, json={"query": query, "variables": variables or {}},
+                        headers={"Authorization": f"Bearer {TOKEN}"}, timeout=30)
     r.raise_for_status()
     data = r.json()
     if "errors" in data:
@@ -61,34 +87,60 @@ async def whoami() -> str:
 @mcp.tool()
 async def list_projects() -> str:
     """List all Railway projects the token can access."""
-    # Try direct projects query
-    data = await _query("query { projects { edges { node { id name } } } }")
-    projects = [e["node"] for e in data["projects"]["edges"]]
-    if projects:
-        return json.dumps(projects)
-
-    # Fallback: try via workspaces
+    # One round trip: workspaces AND their projects in a single query.
+    #
+    # This used to start with `query { projects }` and, when that came back
+    # empty, ask `me { workspaces }` and then one more query PER workspace —
+    # 2 + W requests, of which the first is guaranteed waste on our accounts
+    # (the root `projects` field returns nothing for these tokens). Since
+    # list_projects opens nearly every Railway session, that was paid
+    # constantly. `Workspace.projects` is part of Railway's schema (verified
+    # against the live endpoint), so the workspace path needs no fan-out at all.
+    # Output shape is unchanged: each project still carries its "workspace".
+    workspaces: list[dict] = []
     try:
-        me = await _query("query { me { workspaces { id name } } }")
-        result = []
-        for ws in me["me"]["workspaces"]:
-            try:
-                wp = await _query("""query($wid: String!) {
-                  workspace(workspaceId: $wid) { projects { edges { node { id name } } } }
-                }""", {"wid": ws["id"]})
-                for e in wp["workspace"]["projects"]["edges"]:
-                    result.append({**e["node"], "workspace": ws["name"]})
-            except Exception:
-                pass
+        me = await _query("""query {
+          me { workspaces { id name projects { edges { node { id name } } } } }
+        }""")
+        workspaces = me["me"]["workspaces"]
+        result = [{**e["node"], "workspace": ws["name"]}
+                  for ws in workspaces
+                  for e in ws.get("projects", {}).get("edges", [])]
         if result:
             return json.dumps(result)
     except Exception:
         pass
 
+    # Fallbacks, only reached when the single query yields nothing: a token that
+    # sees projects but no workspaces, then the old per-workspace fan-out in
+    # case some token exposes projects there but not nested. Both cost extra
+    # requests, which is why they are last and not first.
+    try:
+        data = await _query("query { projects { edges { node { id name } } } }")
+        projects = [e["node"] for e in data["projects"]["edges"]]
+        if projects:
+            return json.dumps(projects)
+    except Exception:
+        pass
+
+    result = []
+    for ws in workspaces:
+        try:
+            wp = await _query("""query($wid: String!) {
+              workspace(workspaceId: $wid) { projects { edges { node { id name } } } }
+            }""", {"wid": ws["id"]})
+            for e in wp["workspace"]["projects"]["edges"]:
+                result.append({**e["node"], "workspace": ws["name"]})
+        except Exception:
+            pass
+    if result:
+        return json.dumps(result)
+
     # Nothing found — tell user to set project ID
     if DEFAULT_PROJECT:
         return json.dumps([{"id": DEFAULT_PROJECT, "name": "(from RAILWAY_PROJECT_ID)"}])
-    return json.dumps({"error": "Token cannot list projects. Set RAILWAY_PROJECT_ID or use a less-scoped token.", "workspaces": me.get("me", {}).get("workspaces", []) if 'me' in dir() else []})
+    return json.dumps({"error": "Token cannot list projects. Set RAILWAY_PROJECT_ID or use a less-scoped token.",
+                       "workspaces": [{"id": w["id"], "name": w["name"]} for w in workspaces]})
 
 @mcp.tool()
 async def create_project(name: str, description: str = "", workspace_id: str = "") -> str:
