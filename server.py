@@ -461,13 +461,52 @@ async def get_metrics(project_id: str, environment_id: str, service_id: str,
     })
     return json.dumps(data.get("metrics", []))
 
+# Statuses whose deployment still has a container to restart. Everything else
+# either never ran (FAILED, SKIPPED), is already gone (REMOVED, REMOVING) or is
+# on its way up already (BUILDING, DEPLOYING, QUEUED…), and restarting it is
+# either impossible or pointless.
+_RESTARTABLE_STATUSES = ("SUCCESS", "SLEEPING", "CRASHED")
+
+
 @mcp.tool()
 async def deploy(project_id: str, environment_id: str, service_id: str) -> str:
-    """Trigger a deploy for a service (via restart)."""
-    data = await _query("""mutation($sid: String!) {
-      deploymentRestart(id: $sid)
-    }""", {"sid": service_id})
-    return json.dumps(data)
+    """Trigger a deploy for a service (via restart of its current deployment).
+
+    Railway's deploymentRestart takes a DEPLOYMENT id, not a service id — a
+    service id passed to it is simply an id that matches no deployment, and the
+    API answers "Deployment not found" even while the service is running
+    happily. So resolve the service's newest restartable deployment first, with
+    the same deployments(DeploymentListInput) lookup get_logs uses, and restart
+    that.
+    """
+    deployments = await _query("""query($input: DeploymentListInput!) {
+      deployments(input: $input, first: 10) {
+        edges { node { id createdAt status } }
+      }
+    }""", {"input": {
+        "projectId": project_id, "environmentId": environment_id, "serviceId": service_id
+    }})
+    nodes = [e["node"] for e in deployments.get("deployments", {}).get("edges", [])]
+    if not nodes:
+        return json.dumps({"error": "No deployments found for this project/environment/service"})
+    nodes.sort(key=lambda d: d["createdAt"], reverse=True)
+
+    target = next((d for d in nodes if d["status"] in _RESTARTABLE_STATUSES), None)
+    if target is None:
+        return json.dumps({
+            "error": "No restartable deployment for this service — its newest "
+                     f"deployment is {nodes[0]['status']}. Restart needs a "
+                     "deployment that is running (or crashed/sleeping); deploy "
+                     "the service first.",
+            "recentStatuses": [d["status"] for d in nodes[:5]],
+        })
+
+    data = await _query("""mutation($did: String!) {
+      deploymentRestart(id: $did)
+    }""", {"did": target["id"]})
+    return json.dumps({"deploymentId": target["id"],
+                       "deploymentStatus": target["status"],
+                       "restarted": data.get("deploymentRestart")})
 
 
 # ── domain tools ────────────────────────────────────────────────────
