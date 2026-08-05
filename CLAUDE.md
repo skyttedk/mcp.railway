@@ -71,8 +71,8 @@ py -3.12 -m venv .venv
 The suite is stdlib `unittest`, so there is no test framework to install, but it
 imports `server.py` and therefore needs `requirements.txt` installed. It needs no
 Railway credentials and never contacts the Railway API: it swaps `server._session`
-for a fake at the HTTP boundary and refuses any call that forgets to. **58 tests,
-0.98 s, verified 2026-08-05** on Python 3.12.10. `tests/README.md` explains what
+for a fake at the HTTP boundary and refuses any call that forgets to. **60 tests,
+0.77 s, verified 2026-08-05** on Python 3.12.10. `tests/README.md` explains what
 each class is protecting and why.
 
 GitHub Actions runs the same command on every push and pull request
@@ -139,6 +139,19 @@ cheapest liveness check.
   service is running must read that flag — trusting `status` reports a stopped
   service as healthy and a failed build's logs as the live ones. Tests pin this in
   `StopStartTest` and `LogProvenanceTest`.
+- **`list_services` cannot tell you whether a deploy landed.** Its
+  `latestDeployment` is Railway's own per-instance pointer and it lags: during a
+  real deploy it kept naming the previous deployment across three checks, still
+  stale well after the new code was provably serving traffic (card 2026-08-05).
+  It is not the wrong field — compared against the `deployments` list on 24
+  service instances across both accounts it agreed every time, including on a
+  CRASHED deployment — it is simply late, and it does catch up. Nothing can be
+  read off the id or the status to tell a lagging value from a push that never
+  landed, which is why the listing now also returns the deployment's `createdAt`
+  and the description says outright that this is not a deploy check. Confirm a
+  deploy with the id `create_deployment` returns, or with `get_logs`, which
+  queries `deployments(DeploymentListInput)` directly. `DeploymentFreshnessTest`
+  pins both halves.
 - **`deploy` and `create_deployment` are not the same operation, and the
   confusion is silent.** `deploy` restarts the container already running and
   builds nothing, so an agent reaching for it sees a success and reports that new
