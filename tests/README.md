@@ -87,6 +87,20 @@ also hold `get_logs` to reading `deploymentStopped` rather than trusting
 failed build's logs — and to leaving the default answer the newest deployment's,
 so existing callers are untouched.
 
+And one class for how fresh the service listing's deployment is
+(`DeploymentFreshnessTest`), because that answer is confidently wrong rather
+than missing. `latestDeployment` is Railway's per-instance pointer and it lags:
+during a real deploy it kept naming the previous deployment across three
+checks, still stale well after the new code was answering live traffic. It is
+the right field — checked against the deployments list on 24 service instances
+across both accounts it agreed every time, including on a CRASHED deployment —
+so there is nothing to correct, only lateness to make visible. The tests hold
+the listing to asking Railway for the deployment's `createdAt` and passing it
+through, so a value from before the push you just made is recognisable instead
+of being an unchanged id that reads like a push that never landed; and they
+hold the description to saying it cannot confirm a deploy and naming
+`get_logs` and `create_deployment`, which can.
+
 ## After an intended change to a tool's arguments
 
 The contract test fails on purpose. Confirm the change is wanted, then:

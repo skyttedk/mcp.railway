@@ -624,6 +624,63 @@ class StopStartTest(_StubbedServer):
         self.assertEqual("SUCCESS", instance["latestDeployment"]["status"])
 
 
+class DeploymentFreshnessTest(_StubbedServer):
+    """`latestDeployment` cannot answer "did my deploy land?", and must not
+    look as though it can.
+
+    Railway's per-instance pointer lags: during a real deploy it kept naming
+    the previous deployment across three checks, still stale well after the new
+    code was answering live traffic. It is the newest deployment the API knows
+    about — checked against the deployments list on 24 service instances across
+    both accounts, including a CRASHED one, it agreed every time — so the field
+    is right and merely late, and there is nothing here to correct.
+
+    What was wrong is that the lateness was invisible. The old answer carried
+    an opaque id and a status that reads SUCCESS before and after, so a stale
+    value is indistinguishable from a push that never happened. `createdAt`
+    makes it visible, and the description sends the reader to the tools that
+    can actually confirm a deploy."""
+
+    _ONE_SERVICE = {"project(id:": {"project": {"services": {"edges": [
+        {"node": {"id": "svc1", "name": "api", "serviceInstances": {"edges": [
+            {"node": {"environmentId": "e1", "region": None, "numReplicas": 1,
+                      "latestDeployment": {"id": "dep-old",
+                                           "createdAt": "2026-08-01T10:00:00Z",
+                                           "status": "SUCCESS",
+                                           "deploymentStopped": False}}},
+        ]}}},
+    ]}}}}
+
+    async def test_the_listing_says_when_the_deployment_it_names_was_created(self):
+        """Without a timestamp the caller has only an id it has to have
+        memorised beforehand to spot that nothing moved."""
+        session = self.install(self._ONE_SERVICE)
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "list_services", {"project_id": "p1"})))
+
+        self.assertIn("createdAt", session.calls[0]["query"],
+                      "the query does not ask Railway when the deployment was made")
+        self.assertEqual("2026-08-01T10:00:00Z",
+                         result[0]["instances"][0]["latestDeployment"]["createdAt"],
+                         "the age of the named deployment never reaches the caller")
+
+    async def test_the_description_denies_being_a_deploy_check(self):
+        """The fix is carried by the words: an agent reading the tool list must
+        learn here that this value cannot confirm a deploy, and which tool can.
+        A later tidy-up of the docstring must fail this, not pass quietly."""
+        tools = {t.name: (t.description or "").lower()
+                 for t in await server.mcp.list_tools()}
+        listing = tools["list_services"]
+
+        self.assertIn("confirm", listing,
+                      "nothing in the description warns about confirming a deploy")
+        self.assertIn("stale", listing)
+        self.assertIn("get_logs", listing,
+                      "the description does not point at a tool that can answer it")
+        self.assertIn("create_deployment", listing)
+
+
 class DeleteServiceTest(_StubbedServer):
     """Deleting a service is the one operation here with no undo.
 

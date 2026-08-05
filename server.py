@@ -298,14 +298,27 @@ async def list_services(project_id: str = "") -> str:
     (no per-service override) — use get_service_instance / list_regions for
     details.
 
-    Every instance also carries `latestDeployment` {id, status,
+    Every instance also carries `latestDeployment` {id, createdAt, status,
     deploymentStopped}, which is how you tell a stopped service from a running
     one: Railway has NO "stopped" deployment status, so a deployment stopped by
     stop_service keeps the status it already had (usually SUCCESS) and is
     flagged deploymentStopped=true instead. Without that flag a stopped service
     looks identical to a live one here — and a service whose domain has been
     removed shows up nowhere else — which is exactly how a service ends up
-    forgotten. latestDeployment null means the service has never deployed."""
+    forgotten. latestDeployment null means the service has never deployed.
+
+    DO NOT USE THIS TO CONFIRM THAT A DEPLOY LANDED. `latestDeployment` is
+    Railway's own per-instance pointer, and it has been seen naming the
+    PREVIOUS deployment for the whole of a deploy — still stale well after the
+    new code was provably answering live traffic. It does catch up, so it is
+    not wrong so much as late, and neither the id nor the status says which of
+    the two you are holding: an unchanged id reads exactly like a push that
+    never landed. That is why `createdAt` is asked for and returned — a
+    deployment created before the push you just made is the stale one, and
+    now visibly so. To actually confirm a deploy, use the deployment id
+    create_deployment returns, or call get_logs: it reads the deployments list
+    directly and reports deploymentId, deploymentCreatedAt and
+    deploymentIsRunning."""
     pid = _pid(project_id)
     if not pid:
         return json.dumps({"error": "No project_id provided and RAILWAY_PROJECT_ID not set"})
@@ -317,7 +330,7 @@ async def list_services(project_id: str = "") -> str:
           environmentId
           region
           numReplicas
-          latestDeployment { id status deploymentStopped }
+          latestDeployment { id createdAt status deploymentStopped }
         } } }
       } } } }
     }""", {"id": pid})
