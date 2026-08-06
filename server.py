@@ -355,8 +355,9 @@ async def list_regions() -> str:
 
 @mcp.tool()
 async def get_service_instance(environment_id: str, service_id: str) -> str:
-    """Get one service's per-environment deploy config: region, replicas,
-    builder, commands, healthcheck, sleep/cron settings.
+    """Get one service's per-environment deploy config: source (repo or Docker
+    image), region, replicas, builder, Dockerfile path, commands, healthcheck,
+    sleep/cron settings. This is the read side of set_service_config.
 
     `region` is the per-service override; null means the service inherits
     Railway's default region (currently US West / us-west2 for new services —
@@ -373,6 +374,9 @@ async def get_service_instance(environment_id: str, service_id: str) -> str:
         startCommand
         preDeployCommand
         rootDirectory
+        dockerfilePath
+        watchPatterns
+        source { image repo }
         healthcheckPath
         healthcheckTimeout
         sleepApplication
@@ -434,33 +438,186 @@ async def set_start_command(environment_id: str, service_id: str, start_command:
     return json.dumps(result)
 
 
+# Railway's own enums. Sent as GraphQL enum values, so a typo is rejected by
+# the API with a parse error that names neither the tool nor the argument —
+# checking here turns that into a message the caller can act on.
+_BUILDERS = ("RAILPACK", "NIXPACKS", "PAKETO", "HEROKU")
+_RESTART_POLICIES = ("ALWAYS", "NEVER", "ON_FAILURE")
+
+
 @mcp.tool()
-async def create_service(project_id: str, environment_id: str, name: str) -> str:
-    """Create a new Railway service inside a project/environment."""
+async def set_service_config(environment_id: str, service_id: str,
+                             dockerfile_path: str | None = None,
+                             root_directory: str | None = None,
+                             builder: str | None = None,
+                             build_command: str | None = None,
+                             watch_patterns: list[str] | None = None,
+                             railway_config_file: str | None = None,
+                             pre_deploy_command: list[str] | None = None,
+                             healthcheck_path: str | None = None,
+                             healthcheck_timeout: int | None = None,
+                             num_replicas: int | None = None,
+                             restart_policy_type: str | None = None,
+                             restart_policy_max_retries: int | None = None,
+                             cron_schedule: str | None = None,
+                             sleep_application: bool | None = None,
+                             redeploy: bool = False) -> str:
+    """Set build and deploy settings for a service in one environment — the
+    dashboard's Settings tab, minus what already has its own tool
+    (set_region, set_start_command, set_variables).
+
+    Every setting is optional and **omitting one leaves it untouched**; only
+    the arguments actually passed are sent to Railway. For the string
+    settings, passing an empty string CLEARS the override instead, so the
+    service falls back to Railway's default. Read the current values back with
+    get_service_instance.
+
+    - dockerfile_path — build from a Dockerfile that is not `./Dockerfile`,
+      e.g. "docker/Dockerfile.web". This is the same setting as the
+      `RAILWAY_DOCKERFILE_PATH` service variable; set it here rather than as a
+      variable, so it does not read as application config.
+    - root_directory — build from a subdirectory of the repo (monorepos).
+    - builder — one of RAILPACK, NIXPACKS, PAKETO, HEROKU. NB: there is no
+      DOCKERFILE builder; a Dockerfile is picked up by its presence (or by
+      dockerfile_path), not by choosing a builder.
+    - watch_patterns — only redeploy when these paths change, e.g.
+      ["apps/api/**"]. An empty list clears the filter (redeploy on any change).
+    - pre_deploy_command — a LIST of strings, run before the new deployment
+      goes live (migrations); an empty list clears it.
+    - restart_policy_type — one of ALWAYS, NEVER, ON_FAILURE.
+    - sleep_application — serverless-style sleep when idle.
+
+    Like the other setters, changes take effect on the NEXT deploy — pass
+    redeploy=true to trigger one immediately."""
+    if builder and builder.upper() not in _BUILDERS:
+        return json.dumps({"error": (
+            f"builder must be one of {', '.join(_BUILDERS)} (got {builder!r}). "
+            "There is no DOCKERFILE builder — a Dockerfile is picked up by its "
+            "presence, or by dockerfile_path.")})
+    if restart_policy_type and restart_policy_type.upper() not in _RESTART_POLICIES:
+        return json.dumps({"error": (
+            f"restart_policy_type must be one of {', '.join(_RESTART_POLICIES)} "
+            f"(got {restart_policy_type!r})")})
+
+    # An empty string clears a string setting (sent as null); an empty list
+    # clears a list setting (sent as []) — an empty list is a meaningful value
+    # to Railway, so it must not be collapsed to null the way "" is.
+    strings = {
+        "dockerfilePath": dockerfile_path,
+        "rootDirectory": root_directory,
+        "buildCommand": build_command,
+        "railwayConfigFile": railway_config_file,
+        "healthcheckPath": healthcheck_path,
+        "cronSchedule": cron_schedule,
+    }
+    enums = {
+        "builder": builder.upper() if builder else builder,
+        "restartPolicyType": (restart_policy_type.upper() if restart_policy_type
+                              else restart_policy_type),
+    }
+    others = {
+        "watchPatterns": watch_patterns,
+        "preDeployCommand": pre_deploy_command,
+        "healthcheckTimeout": healthcheck_timeout,
+        "numReplicas": num_replicas,
+        "restartPolicyMaxRetries": restart_policy_max_retries,
+        "sleepApplication": sleep_application,
+    }
+    payload: dict = {k: (v or None) for k, v in {**strings, **enums}.items()
+                     if v is not None}
+    payload.update({k: v for k, v in others.items() if v is not None})
+
+    if not payload:
+        return json.dumps({"error": (
+            "No settings given, so nothing was changed. Pass at least one of: "
+            "dockerfile_path, root_directory, builder, build_command, "
+            "watch_patterns, railway_config_file, pre_deploy_command, "
+            "healthcheck_path, healthcheck_timeout, num_replicas, "
+            "restart_policy_type, restart_policy_max_retries, cron_schedule, "
+            "sleep_application.")})
+
+    await _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
+      serviceInstanceUpdate(serviceId: $sid, environmentId: $eid, input: $input)
+    }""", {"sid": service_id, "eid": environment_id, "input": payload})
+    result: dict = {"serviceId": service_id, "environmentId": environment_id,
+                    "applied": payload, "updated": True, "redeployed": False}
+    if redeploy:
+        await _query("""mutation($sid: String!, $eid: String!) {
+          serviceInstanceRedeploy(serviceId: $sid, environmentId: $eid)
+        }""", {"sid": service_id, "eid": environment_id})
+        result["redeployed"] = True
+    else:
+        result["note"] = "Settings take effect on the next deploy."
+    return json.dumps(result)
+
+
+@mcp.tool()
+async def create_service(project_id: str, environment_id: str, name: str,
+                         repo: str = "", image: str = "", branch: str = "") -> str:
+    """Create a new Railway service inside a project/environment.
+
+    Optionally give it a source in the same call, so the service is deployable
+    immediately instead of being an empty shell that has to be finished in the
+    dashboard:
+
+    - repo — a GitHub repo as "owner/name" (the account's GitHub App must
+      already have access to it), optionally with `branch`.
+    - image — a public Docker image as "gotenberg/gotenberg:8". No repo, no
+      Dockerfile and no build: Railway pulls and runs it.
+
+    repo and image are mutually exclusive. Passing neither creates the empty
+    service the old signature did; attach a source later with connect_service.
+    Build settings (Dockerfile path, root directory, healthcheck) are not part
+    of this mutation — set them with set_service_config afterwards."""
+    if repo and image:
+        return json.dumps({"error": "Pass repo OR image, not both — a Railway "
+                                    "service has one source. Nothing was created."})
+    if branch and not repo:
+        return json.dumps({"error": "branch applies to a repo source only. Pass "
+                                    "repo as well, or drop branch. Nothing was "
+                                    "created."})
+    payload: dict = {
+        "projectId": project_id,
+        "environmentId": environment_id,
+        "name": name,
+    }
+    if repo or image:
+        payload["source"] = {"repo": repo} if repo else {"image": image}
+    if branch:
+        payload["branch"] = branch
     data = await _query("""mutation($input: ServiceCreateInput!) {
       serviceCreate(input: $input) {
         id
         name
       }
-    }""", {"input": {
-        "projectId": project_id,
-        "environmentId": environment_id,
-        "name": name,
-    }})
+    }""", {"input": payload})
     return json.dumps(data["serviceCreate"])
 
 @mcp.tool()
-async def connect_service(service_id: str, repo: str, branch: str = "master") -> str:
-    """Connect a Railway service to a GitHub repo/branch for auto deploys."""
+async def connect_service(service_id: str, repo: str = "", branch: str = "master",
+                          image: str = "") -> str:
+    """Point an existing Railway service at a source.
+
+    Either a GitHub repo/branch for auto deploys (`repo` as "owner/name"), or a
+    Docker image (`image` as "gotenberg/gotenberg:8") that Railway pulls and
+    runs with no build step. The two are mutually exclusive, and `branch` is
+    ignored for an image source.
+
+    This REPLACES the service's current source."""
+    if repo and image:
+        return json.dumps({"error": "Pass repo OR image, not both — a Railway "
+                                    "service has one source. Nothing was changed."})
+    if not repo and not image:
+        return json.dumps({"error": "Nothing to connect: pass repo (a GitHub "
+                                    "'owner/name') or image (a Docker image "
+                                    "reference)."})
+    payload = {"image": image} if image else {"repo": repo, "branch": branch}
     data = await _query("""mutation($id: String!, $input: ServiceConnectInput!) {
       serviceConnect(id: $id, input: $input) {
         id
         name
       }
-    }""", {"id": service_id, "input": {
-        "repo": repo,
-        "branch": branch,
-    }})
+    }""", {"id": service_id, "input": payload})
     return json.dumps(data["serviceConnect"])
 
 @mcp.tool()

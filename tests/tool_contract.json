@@ -15,11 +15,11 @@
   },
   "connect_service": {
     "required": [
-      "repo",
       "service_id"
     ],
     "args": {
       "branch": "string",
+      "image": "string",
       "repo": "string",
       "service_id": "string"
     }
@@ -64,9 +64,12 @@
       "project_id"
     ],
     "args": {
+      "branch": "string",
       "environment_id": "string",
+      "image": "string",
       "name": "string",
-      "project_id": "string"
+      "project_id": "string",
+      "repo": "string"
     }
   },
   "create_service_domain": {
@@ -250,6 +253,31 @@
       "redeploy": "boolean",
       "region": "string",
       "service_id": "string"
+    }
+  },
+  "set_service_config": {
+    "required": [
+      "environment_id",
+      "service_id"
+    ],
+    "args": {
+      "build_command": "null|string",
+      "builder": "null|string",
+      "cron_schedule": "null|string",
+      "dockerfile_path": "null|string",
+      "environment_id": "string",
+      "healthcheck_path": "null|string",
+      "healthcheck_timeout": "integer|null",
+      "num_replicas": "integer|null",
+      "pre_deploy_command": "array|null",
+      "railway_config_file": "null|string",
+      "redeploy": "boolean",
+      "restart_policy_max_retries": "integer|null",
+      "restart_policy_type": "null|string",
+      "root_directory": "null|string",
+      "service_id": "string",
+      "sleep_application": "boolean|null",
+      "watch_patterns": "array|null"
     }
   },
   "set_start_command": {

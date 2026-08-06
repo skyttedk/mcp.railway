@@ -101,6 +101,26 @@ of being an unchanged id that reads like a push that never landed; and they
 hold the description to saying it cannot confirm a deploy and naming
 `get_logs` and `create_deployment`, which can.
 
+And two classes for how a service gets its source and its build settings
+(`ServiceSourceTest`, `ServiceConfigTest`), because both were places where the
+server could do less than Railway can and an agent's only visible option was to
+send the user to the dashboard. The source tests hold `create_service` and
+`connect_service` to sending a `repo` or an `image` but never both, to leaving
+the default branch out of an image connect, and to leaving the old
+three-argument `create_service` call byte-identical, since both namespaces'
+callers already use it. The config tests protect the one distinction that tool
+cannot afford to lose: it sends a partial `ServiceInstanceUpdateInput`, so every
+key in the payload is written, which makes "the caller omitted this" and "the
+caller cleared this" two different things. A setting nobody mentioned must not
+appear at all, `""` and `[]` must clear rather than be dropped, `[]` must stay a
+list because Railway reads it as "no watch filter", and `num_replicas=0` /
+`sleep_application=False` must survive a filter that a naive truthiness check
+would eat. One more is pinned there for a reason that is not obvious from the
+schema: `builder="DOCKERFILE"` is refused locally, with a message naming
+`dockerfile_path`, because there is no `DOCKERFILE` member of Railway's
+`Builder` enum and the API's own answer is a GraphQL parse error naming neither
+the tool nor the argument.
+
 ## After an intended change to a tool's arguments
 
 The contract test fails on purpose. Confirm the change is wanted, then:

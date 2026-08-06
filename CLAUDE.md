@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 An MCP server for Railway hosting, talking straight to Railway's GraphQL API
 (`https://backboard.railway.com/graphql/v2`) — no Railway CLI involved. It covers
 projects, services, environments, variables, deployments, logs, metrics, domains
-and volumes: 31 tools, all of them in one file, `server.py`.
+and volumes: 32 tools, all of them in one file, `server.py`.
 Repo: `skyttedk/mcp.railway`.
 
 It runs two ways from that same file. `MCP_TRANSPORT` unset (or anything other
@@ -71,8 +71,8 @@ py -3.12 -m venv .venv
 The suite is stdlib `unittest`, so there is no test framework to install, but it
 imports `server.py` and therefore needs `requirements.txt` installed. It needs no
 Railway credentials and never contacts the Railway API: it swaps `server._session`
-for a fake at the HTTP boundary and refuses any call that forgets to. **60 tests,
-0.77 s, verified 2026-08-05** on Python 3.12.10. `tests/README.md` explains what
+for a fake at the HTTP boundary and refuses any call that forgets to. **74 tests,
+0.68 s, verified 2026-08-06** on Python 3.12.10. `tests/README.md` explains what
 each class is protecting and why.
 
 GitHub Actions runs the same command on every push and pull request
@@ -84,7 +84,7 @@ on purpose. Confirm the change is wanted, then regenerate and commit the snapsho
 alongside it:
 
 ```powershell
-.\.venv\Scripts\python.exe tests\test_server.py --refresh   # "wrote 31 tools to …"
+.\.venv\Scripts\python.exe tests\test_server.py --refresh   # "wrote 32 tools to …"
 ```
 
 ## Deploy
@@ -152,6 +152,32 @@ cheapest liveness check.
   deploy with the id `create_deployment` returns, or with `get_logs`, which
   queries `deployments(DeploymentListInput)` directly. `DeploymentFreshnessTest`
   pins both halves.
+- **A service's source and its build settings are two different mutations, and
+  neither is `serviceCreate` alone.** `create_service`/`connect_service` set the
+  SOURCE (`ServiceSourceInput`: a GitHub `repo` or a Docker `image` — one or the
+  other, never both); everything else the dashboard's Settings tab offers is
+  `serviceInstanceUpdate`, which `set_service_config` wraps. Until 2026-08-06
+  only the source's repo half existed, so an agent asked to deploy anything
+  needing a Dockerfile path or an image concluded — reasonably, from the tool
+  list — that the API could not do it and handed the job back as manual
+  dashboard work. Two specifics worth keeping written down: **`dockerfilePath`
+  is a first-class field** on `ServiceInstanceUpdateInput` (it is the same
+  setting as the `RAILWAY_DOCKERFILE_PATH` service variable, so it can also be
+  set with `set_variables` — prefer the field, so it does not read as
+  application config), and **the `Builder` enum is `RAILPACK | NIXPACKS |
+  PAKETO | HEROKU` with no `DOCKERFILE` member** — a Dockerfile is selected by
+  its presence or by `dockerfilePath`, never by choosing a builder.
+  `ServiceConfigTest` refuses the `DOCKERFILE` guess with a message naming
+  `dockerfile_path`, because that is the wrong turn an agent actually takes.
+- **In `set_service_config`, an omitted setting and a cleared one must stay
+  different things.** It sends a partial `ServiceInstanceUpdateInput`, and every
+  key present in that payload is written — so a truthiness filter over the
+  arguments would both drop legitimate falsey values (`num_replicas=0`,
+  `sleep_application=False`, an empty `watch_patterns` list, which Railway reads
+  as "no filter") and, in the other direction, any `None` that leaked into the
+  payload would wipe a setting the caller never mentioned. Hence the split:
+  `None` means untouched, `""` clears a string, `[]` clears a list and is sent
+  as `[]` rather than collapsed to null. `ServiceConfigTest` pins all four.
 - **`deploy` and `create_deployment` are not the same operation, and the
   confusion is silent.** `deploy` restarts the container already running and
   builds nothing, so an agent reaching for it sees a success and reports that new

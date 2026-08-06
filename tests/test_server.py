@@ -1411,6 +1411,193 @@ class RefusalWordingTest(_StubbedServer):
         self.assertIn("***", message)
 
 
+class ServiceSourceTest(_StubbedServer):
+    """A service without a source is an empty shell that has to be finished in
+    the dashboard, which is exactly what an agent cannot do. `create_service`
+    and `connect_service` therefore carry Railway's `source` — a GitHub repo or
+    a Docker image — and the two are mutually exclusive, because a service has
+    one source and sending both leaves it ambiguous which one won.
+    """
+
+    async def test_create_service_attaches_a_docker_image(self):
+        session = self.install({"serviceCreate": {"serviceCreate": {
+            "id": "svc1", "name": "gotenberg"}}})
+
+        result = json.loads(await _text(server.mcp.call_tool("create_service", {
+            "project_id": "p1", "environment_id": "e1", "name": "gotenberg",
+            "image": "gotenberg/gotenberg:8"})))
+
+        self.assertEqual("svc1", result["id"])
+        sent = session.calls[0]["variables"]["input"]
+        self.assertEqual({"image": "gotenberg/gotenberg:8"}, sent["source"])
+        self.assertNotIn("branch", sent,
+                         "a branch is meaningless for an image and Railway "
+                         "rejects the combination")
+
+    async def test_create_service_attaches_a_repo_and_branch(self):
+        session = self.install({"serviceCreate": {"serviceCreate": {
+            "id": "svc1", "name": "api"}}})
+
+        await _text(server.mcp.call_tool("create_service", {
+            "project_id": "p1", "environment_id": "e1", "name": "api",
+            "repo": "skyttedk/mcp.railway", "branch": "master"}))
+
+        sent = session.calls[0]["variables"]["input"]
+        self.assertEqual({"repo": "skyttedk/mcp.railway"}, sent["source"])
+        self.assertEqual("master", sent["branch"])
+
+    async def test_create_service_without_a_source_stays_the_old_shape(self):
+        """The pre-existing three-argument call must keep working unchanged —
+        both namespaces' callers use it."""
+        session = self.install({"serviceCreate": {"serviceCreate": {
+            "id": "svc1", "name": "empty"}}})
+
+        await _text(server.mcp.call_tool("create_service", {
+            "project_id": "p1", "environment_id": "e1", "name": "empty"}))
+
+        sent = session.calls[0]["variables"]["input"]
+        self.assertEqual({"projectId": "p1", "environmentId": "e1",
+                          "name": "empty"}, sent)
+
+    async def test_a_service_cannot_be_given_two_sources(self):
+        session = self.install({"serviceCreate": {"serviceCreate": {"id": "svc1"}}})
+
+        result = json.loads(await _text(server.mcp.call_tool("create_service", {
+            "project_id": "p1", "environment_id": "e1", "name": "x",
+            "repo": "a/b", "image": "nginx"})))
+
+        self.assertIn("not both", result["error"])
+        self.assertEqual([], session.calls,
+                         "created the service anyway despite the ambiguity")
+
+    async def test_connect_service_points_a_service_at_an_image(self):
+        session = self.install({"serviceConnect": {"serviceConnect": {
+            "id": "svc1", "name": "gotenberg"}}})
+
+        await _text(server.mcp.call_tool("connect_service", {
+            "service_id": "svc1", "image": "gotenberg/gotenberg:8"}))
+
+        sent = session.calls[0]["variables"]["input"]
+        self.assertEqual({"image": "gotenberg/gotenberg:8"}, sent)
+        self.assertNotIn("branch", sent,
+                         "the default branch leaked into an image connect")
+
+    async def test_connect_service_still_defaults_the_branch_for_a_repo(self):
+        session = self.install({"serviceConnect": {"serviceConnect": {"id": "svc1"}}})
+
+        await _text(server.mcp.call_tool("connect_service", {
+            "service_id": "svc1", "repo": "skyttedk/mcp.railway"}))
+
+        self.assertEqual({"repo": "skyttedk/mcp.railway", "branch": "master"},
+                         session.calls[0]["variables"]["input"])
+
+    async def test_connect_service_refuses_to_do_nothing_quietly(self):
+        session = self.install({"serviceConnect": {"serviceConnect": {"id": "svc1"}}})
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "connect_service", {"service_id": "svc1"})))
+
+        self.assertIn("Nothing to connect", result["error"])
+        self.assertEqual([], session.calls)
+
+
+class ServiceConfigTest(_StubbedServer):
+    """set_service_config is the one tool where an omitted argument and a
+    cleared one must not mean the same thing: it sends a partial
+    ServiceInstanceUpdateInput, and any key present in that payload is written.
+    So a setting the caller never mentioned must not appear at all, or calling
+    it to change the Dockerfile path silently wipes the healthcheck.
+    """
+
+    _ROUTE = {"serviceInstanceUpdate": {"serviceInstanceUpdate": True}}
+
+    async def test_only_the_settings_passed_are_sent(self):
+        session = self.install(self._ROUTE)
+
+        result = json.loads(await _text(server.mcp.call_tool("set_service_config", {
+            "environment_id": "e1", "service_id": "svc1",
+            "dockerfile_path": "docker/Dockerfile.web"})))
+
+        self.assertTrue(result["updated"])
+        self.assertEqual({"dockerfilePath": "docker/Dockerfile.web"},
+                         session.calls[0]["variables"]["input"],
+                         "an untouched setting was included and would be "
+                         "overwritten on the service")
+
+    async def test_an_empty_string_clears_a_setting(self):
+        """The counterpart: there has to be a way to remove an override, and it
+        is the same "" convention set_start_command already uses."""
+        session = self.install(self._ROUTE)
+
+        await _text(server.mcp.call_tool("set_service_config", {
+            "environment_id": "e1", "service_id": "svc1", "root_directory": ""}))
+
+        self.assertEqual({"rootDirectory": None},
+                         session.calls[0]["variables"]["input"])
+
+    async def test_an_empty_list_is_sent_as_a_list_not_as_null(self):
+        """watchPatterns/preDeployCommand are list settings. Collapsing [] to
+        null the way "" is collapsed would send the wrong clear for them."""
+        session = self.install(self._ROUTE)
+
+        await _text(server.mcp.call_tool("set_service_config", {
+            "environment_id": "e1", "service_id": "svc1", "watch_patterns": []}))
+
+        self.assertEqual({"watchPatterns": []},
+                         session.calls[0]["variables"]["input"])
+
+    async def test_falsey_numbers_and_booleans_survive(self):
+        """0 replicas and sleep_application=False are real values a caller may
+        want. A truthiness filter would drop both."""
+        session = self.install(self._ROUTE)
+
+        await _text(server.mcp.call_tool("set_service_config", {
+            "environment_id": "e1", "service_id": "svc1",
+            "num_replicas": 0, "sleep_application": False}))
+
+        self.assertEqual({"numReplicas": 0, "sleepApplication": False},
+                         session.calls[0]["variables"]["input"])
+
+    async def test_an_unknown_builder_is_refused_before_the_call(self):
+        """Railway takes `builder` as a GraphQL enum, so a bad value fails with
+        a parse error naming neither the tool nor the argument. DOCKERFILE is
+        the guess an agent actually makes — it is not a builder."""
+        session = self.install(self._ROUTE)
+
+        result = json.loads(await _text(server.mcp.call_tool("set_service_config", {
+            "environment_id": "e1", "service_id": "svc1", "builder": "DOCKERFILE"})))
+
+        self.assertIn("RAILPACK", result["error"])
+        self.assertIn("dockerfile_path", result["error"],
+                      "the refusal must point at what the caller actually wanted")
+        self.assertEqual([], session.calls)
+
+    async def test_a_call_with_no_settings_changes_nothing_and_says_so(self):
+        session = self.install(self._ROUTE)
+
+        result = json.loads(await _text(server.mcp.call_tool("set_service_config", {
+            "environment_id": "e1", "service_id": "svc1"})))
+
+        self.assertIn("nothing was changed", result["error"].lower())
+        self.assertEqual([], session.calls)
+
+    async def test_redeploy_is_opt_in(self):
+        session = self.install({**self._ROUTE,
+                                "serviceInstanceRedeploy": {"serviceInstanceRedeploy": True}})
+
+        quiet = json.loads(await _text(server.mcp.call_tool("set_service_config", {
+            "environment_id": "e1", "service_id": "svc1", "num_replicas": 2})))
+        self.assertFalse(quiet["redeployed"])
+        self.assertIn("next deploy", quiet["note"])
+        self.assertEqual(1, len(session.calls))
+
+        loud = json.loads(await _text(server.mcp.call_tool("set_service_config", {
+            "environment_id": "e1", "service_id": "svc1", "num_replicas": 2,
+            "redeploy": True})))
+        self.assertTrue(loud["redeployed"])
+        self.assertTrue([c for c in session.calls if "serviceInstanceRedeploy" in c["query"]])
+
+
 async def _text(call) -> str:
     """Pull the tool's string return value out of whatever call_tool answers.
 
