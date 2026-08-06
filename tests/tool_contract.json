@@ -157,6 +157,7 @@
       "service_id"
     ],
     "args": {
+      "build_logs": "string",
       "environment_id": "string",
       "limit": "integer",
       "project_id": "string",

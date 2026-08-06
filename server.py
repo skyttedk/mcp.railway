@@ -719,15 +719,44 @@ def _running_deployment(nodes: list[dict]) -> dict | None:
                 None)
 
 
+# ── build logs are a different query, and the one that explains a failed build ──
+#
+# Railway keeps a deployment's output in two places: buildLogs(deploymentId) is
+# the builder's own output (dependency install, compiler, image export) and
+# deploymentLogs(deploymentId) is what the CONTAINER printed. They are separate
+# queries with identical arguments, and the dashboard shows them as two tabs.
+#
+# A build that fails never starts a container, so deploymentLogs is empty and
+# the reason it failed exists only in buildLogs. Reading just deploymentLogs —
+# which is all this tool did until 2026-08-06 — therefore answers a failed
+# deploy with an empty list and no way to learn why, while the same tool works
+# perfectly on a CRASHED deployment, whose container did run. That is the whole
+# shape of the bug: it is invisible until the deploy you need to diagnose is the
+# one that never got that far.
+#
+# Statuses of a deployment whose container is up and simply has nothing to say
+# yet — a freshly deployed quiet service. For those, empty runtime logs are the
+# honest answer and pulling the build output on top would only be noise; for
+# every other status an empty answer means the output is in the other query.
+_QUIET_IS_NORMAL_STATUSES = ("SUCCESS", "SLEEPING")
+
+
 @mcp.tool()
 async def get_logs(project_id: str, environment_id: str, service_id: str,
-             limit: int = 50, source: str = "latest") -> str:
+             limit: int = 50, source: str = "latest",
+             build_logs: str = "auto") -> str:
     """Get recent deployment logs for a service, and say which deployment they
     came from.
 
     Railway's API has no deploymentLogs(projectId/environmentId/serviceId) query —
     logs are keyed by deploymentId. This looks up the service's deployments for
     the given project/environment, picks one, then fetches that deployment's logs.
+
+    A DEPLOYMENT HAS TWO SETS OF LOGS. `logs` is what the container printed;
+    `buildLogs` is what the builder printed. A build that fails never starts a
+    container, so `logs` is empty and the reason for the failure is in
+    `buildLogs` only — which is why an answer with no container output fetches
+    the build output as well, and says so in `buildLogsNote`.
 
     THE NEWEST DEPLOYMENT IS NOT ALWAYS THE ONE SERVING TRAFFIC. A build that
     fails is still the newest deployment, while the service keeps running the
@@ -745,11 +774,25 @@ async def get_logs(project_id: str, environment_id: str, service_id: str,
                 (newest one that is SUCCESS/SLEEPING/CRASHED and not stopped).
                 What you want when investigating live behaviour. Refuses,
                 naming the recent statuses, if nothing is running.
+
+    build_logs:
+      "auto"    (default) — also fetch the build output when the container
+                printed nothing and the deployment is not simply a healthy,
+                quiet one, i.e. exactly when the empty answer would otherwise
+                be unexplained.
+      "always"  — fetch it regardless. For a build that SUCCEEDED but is slow
+                or produced something unexpected.
+      "never"   — container logs only, the behaviour before 2026-08-06.
     """
     if source not in ("latest", "running"):
         return json.dumps({"error": f"Unknown source {source!r} — use \"latest\" "
                                     "(the most recent deployment, the default) or "
                                     "\"running\" (the one serving traffic)."})
+    if build_logs not in ("auto", "always", "never"):
+        return json.dumps({"error": f"Unknown build_logs {build_logs!r} — use "
+                                    "\"auto\" (the default: the build's output is "
+                                    "added when the container printed nothing), "
+                                    "\"always\" or \"never\"."})
 
     deployments = await _query("""query($input: DeploymentListInput!) {
       deployments(input: $input, first: 10) {
@@ -814,7 +857,38 @@ async def get_logs(project_id: str, environment_id: str, service_id: str,
     if not is_running:
         result["runningDeploymentId"] = running["id"] if running else None
         result["runningDeploymentStatus"] = running["status"] if running else None
-    result["logs"] = data.get("deploymentLogs", [])
+    container_logs = data.get("deploymentLogs", [])
+    result["logs"] = container_logs
+
+    want_build = build_logs == "always" or (
+        build_logs == "auto" and not container_logs
+        and target["status"] not in _QUIET_IS_NORMAL_STATUSES)
+    if want_build:
+        try:
+            build = await _query("""query($did: String!, $limit: Int!) {
+              buildLogs(deploymentId: $did, limit: $limit) {
+                timestamp message
+              }
+            }""", {"did": target["id"], "limit": limit})
+        except RuntimeError as exc:
+            # Never turn an answer into an error over the extra query: the
+            # container logs above are still worth returning.
+            result["buildLogsNote"] = (
+                f"The build output could not be read — Railway answered: {exc}")
+        else:
+            lines = build.get("buildLogs", [])
+            result["buildLogs"] = lines
+            if not container_logs:
+                result["buildLogsNote"] = (
+                    f"`logs` is empty because deployment {target['id']} "
+                    f"({target['status']}) never reached the container stage — "
+                    "read `buildLogs` instead, which is the builder's own output "
+                    "and where the reason lives."
+                    if lines else
+                    f"Deployment {target['id']} ({target['status']}) has neither "
+                    "container output nor build output. Railway kept no lines for "
+                    "it — a build that was cancelled or skipped before it ran, or "
+                    "one old enough that its logs have been dropped.")
     return json.dumps(result)
 
 # ── keeping a metrics answer small enough to read ────────────────────

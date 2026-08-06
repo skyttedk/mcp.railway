@@ -87,6 +87,25 @@ also hold `get_logs` to reading `deploymentStopped` rather than trusting
 failed build's logs — and to leaving the default answer the newest deployment's,
 so existing callers are untouched.
 
+And one class for a failed build's own output (`BuildLogTest`), because a
+deployment keeps its output in two places and the tool only ever read one.
+`buildLogs` is the builder's, `deploymentLogs` is the container's, and a build
+that fails never starts a container — so the query that was asked came back
+empty and the reason lived in the query that was not, while the docstring
+promised the failed build's output outright. The tool looked healthy from every
+other angle, since a CRASHED deployment did run and still returns a full stack
+trace; the hole opened only on the failure people most need explained, and cost
+a real investigation. So the tests hold both directions: the build output is
+fetched and its arrival explained when the container printed nothing, and it is
+NOT fetched when the container logs already answer — a CRASHED deployment, or a
+healthy service that has simply been quiet, must not pay for a second query or
+have the stack trace buried under an image build. The rest guard the edges that
+would turn a fix into a new defect: build output read from the same deployment
+the answer names, a deployment with genuinely nothing said in those words rather
+than pointed at an empty list, a typo'd argument refused by name, and a build
+query Railway rejects costing only itself instead of throwing away container
+logs that worked.
+
 And one class for how fresh the service listing's deployment is
 (`DeploymentFreshnessTest`), because that answer is confidently wrong rather
 than missing. `latestDeployment` is Railway's per-instance pointer and it lags:

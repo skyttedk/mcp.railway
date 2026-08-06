@@ -1328,6 +1328,224 @@ class LogProvenanceTest(_StubbedServer):
         self.assertIn("No deployments found", result["error"])
 
 
+class BuildLogTest(_StubbedServer):
+    """A failed BUILD must return the build's own output.
+
+    Railway keeps a deployment's output in two queries with identical
+    arguments: buildLogs(deploymentId) is the builder's, deploymentLogs is the
+    container's. A build that fails never starts a container, so the second is
+    empty and the reason exists only in the first — and this tool asked for the
+    second alone, so it answered a failed deploy with `logs: []` and nothing
+    else. The docstring promised the opposite ("the failed build's own output is
+    the reason it failed"), so the emptiness read as "Railway kept nothing"
+    rather than "asked the wrong query".
+
+    What made it expensive is that the tool looked fine everywhere else: a
+    CRASHED deployment, whose container did run, returns a full stack trace. The
+    hole opens only at the moment it is needed most — a production build failing
+    — and it cost a real investigation, which had to stop and hand over to
+    someone with dashboard access.
+
+    So both halves are pinned: the build output arrives when the container
+    printed nothing, and the second query is NOT paid for when the container
+    logs already answer the question."""
+
+    # A build that failed: newest deployment, no container, nothing in the
+    # container's log stream. The exact shape reported on the card.
+    _BUILD_FAILED = {
+        "deployments(input:": {"deployments": {"edges": [
+            {"node": {"id": "dep-new", "createdAt": "2026-08-04T12:00:00Z",
+                      "status": "FAILED", "deploymentStopped": False}},
+            {"node": {"id": "dep-live", "createdAt": "2026-08-04T10:00:00Z",
+                      "status": "SUCCESS", "deploymentStopped": False}},
+        ]}},
+        "deploymentLogs(deploymentId:": {"deploymentLogs": []},
+        "buildLogs(deploymentId:": {"buildLogs": [
+            {"timestamp": "2026-08-04T12:00:30Z",
+             "message": "ERROR: failed to solve: process \"/bin/sh -c pip "
+                        "install -r requirements.txt\" did not complete"}]},
+    }
+
+    async def test_a_failed_build_returns_the_build_output(self):
+        """The card. An empty `logs` must be accompanied by the build output
+        that explains it, read from the same deployment."""
+        session = self.install(self._BUILD_FAILED)
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1"})))
+
+        self.assertEqual([], result["logs"])
+        self.assertEqual(1, len(result["buildLogs"]),
+                         "a failed build was answered without its build output")
+        self.assertIn("pip install", result["buildLogs"][0]["message"])
+        build = next(c for c in session.calls if "buildLogs(deploymentId:" in c["query"])
+        self.assertEqual("dep-new", build["variables"]["did"],
+                         "the build output came from a different deployment "
+                         "than the one the answer names")
+
+    async def test_the_empty_container_log_is_explained(self):
+        """`logs: []` next to a populated `buildLogs` is the thing a reader has
+        to interpret, so the answer says outright which one to read and why the
+        other is empty — otherwise the emptiness still looks like the defect."""
+        self.install(self._BUILD_FAILED)
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1"})))
+
+        note = result["buildLogsNote"]
+        self.assertIn("buildLogs", note, "the note must name the list to read")
+        self.assertIn("dep-new", note)
+        self.assertIn("FAILED", note)
+
+    async def test_a_deployment_with_no_output_at_all_says_so(self):
+        """When neither query has anything, the answer must not point at an
+        empty `buildLogs` as if it held the reason. Railway keeping nothing and
+        this tool asking the wrong query are exactly the two possibilities the
+        card could not tell apart — so the one case where the answer really is
+        "nothing was kept" has to say that in those words."""
+        self.install({
+            "deployments(input:": {"deployments": {"edges": [
+                {"node": {"id": "dep-new", "createdAt": "2026-08-04T12:00:00Z",
+                          "status": "FAILED", "deploymentStopped": False}},
+            ]}},
+            "deploymentLogs(deploymentId:": {"deploymentLogs": []},
+            "buildLogs(deploymentId:": {"buildLogs": []},
+        })
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1"})))
+
+        self.assertEqual([], result["buildLogs"])
+        self.assertIn("neither", result["buildLogsNote"])
+
+    async def test_a_crashed_deployment_is_answered_by_one_query_as_before(self):
+        """The case that already worked must not change or slow down. A CRASHED
+        deployment ran, so its container output is the answer; fetching the
+        build output on top would double the cost and bury the stack trace the
+        caller came for."""
+        session = self.install({
+            "deployments(input:": {"deployments": {"edges": [
+                {"node": {"id": "dep-live", "createdAt": "2026-08-04T10:00:00Z",
+                          "status": "CRASHED", "deploymentStopped": False}},
+            ]}},
+            "deploymentLogs(deploymentId:": {"deploymentLogs": [
+                {"timestamp": "2026-08-04T10:00:09Z",
+                 "message": "Traceback (most recent call last):"}]},
+        })
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1"})))
+
+        self.assertEqual(1, len(result["logs"]))
+        self.assertNotIn("buildLogs", result)
+        self.assertNotIn("buildLogsNote", result)
+        self.assertFalse([c for c in session.calls
+                          if "buildLogs(deploymentId:" in c["query"]])
+
+    async def test_a_quiet_healthy_deployment_is_left_alone(self):
+        """A service that deployed fine and has simply not logged yet is not a
+        build problem. Empty is the honest answer there, and appending the build
+        output would make every quiet service look like it needs diagnosing."""
+        session = self.install({
+            "deployments(input:": {"deployments": {"edges": [
+                {"node": {"id": "dep-live", "createdAt": "2026-08-04T10:00:00Z",
+                          "status": "SUCCESS", "deploymentStopped": False}},
+            ]}},
+            "deploymentLogs(deploymentId:": {"deploymentLogs": []},
+        })
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1"})))
+
+        self.assertEqual([], result["logs"])
+        self.assertNotIn("buildLogs", result)
+        self.assertFalse([c for c in session.calls
+                          if "buildLogs(deploymentId:" in c["query"]])
+
+    async def test_build_output_can_be_asked_for_on_a_successful_build(self):
+        """The automatic rule only fires on an empty container log, so a build
+        that SUCCEEDED but was slow or produced something odd would be
+        unreachable without an explicit way to ask."""
+        session = self.install({
+            "deployments(input:": {"deployments": {"edges": [
+                {"node": {"id": "dep-live", "createdAt": "2026-08-04T10:00:00Z",
+                          "status": "SUCCESS", "deploymentStopped": False}},
+            ]}},
+            "deploymentLogs(deploymentId:": {"deploymentLogs": [
+                {"timestamp": "2026-08-04T10:00:01Z", "message": "listening"}]},
+            "buildLogs(deploymentId:": {"buildLogs": [
+                {"timestamp": "2026-08-04T09:59:00Z", "message": "exporting layers"}]},
+        })
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1", "build_logs": "always"})))
+
+        self.assertEqual(1, len(result["logs"]))
+        self.assertEqual(1, len(result["buildLogs"]))
+        self.assertNotIn("buildLogsNote", result,
+                         "nothing to explain — the container logs are there too")
+        self.assertTrue([c for c in session.calls
+                         if "buildLogs(deploymentId:" in c["query"]])
+
+    async def test_build_output_can_be_declined(self):
+        """The pre-2026-08-06 behaviour stays reachable for a caller who wants
+        one query and one list, and it must not smuggle the second one in."""
+        session = self.install(self._BUILD_FAILED)
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1", "build_logs": "never"})))
+
+        self.assertEqual([], result["logs"])
+        self.assertNotIn("buildLogs", result)
+        self.assertFalse([c for c in session.calls
+                          if "buildLogs(deploymentId:" in c["query"]])
+
+    async def test_an_unknown_build_logs_value_is_refused_by_name(self):
+        """Same rule as `source`: a typo must not fall back to the default and
+        answer a different question than the one asked."""
+        session = self.install(self._BUILD_FAILED)
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1", "build_logs": "yes"})))
+
+        self.assertIn("yes", result["error"])
+        self.assertIn("auto", result["error"])
+        self.assertFalse(session.calls, "queried Railway despite a bad argument")
+
+    async def test_a_refused_build_query_does_not_lose_the_container_logs(self):
+        """The build query is an addition, so its failure must cost only itself.
+        Letting the error propagate would turn answers that work today into
+        exceptions — the opposite of the card."""
+        session = self.install({
+            "deployments(input:": {"deployments": {"edges": [
+                {"node": {"id": "dep-live", "createdAt": "2026-08-04T10:00:00Z",
+                          "status": "SUCCESS", "deploymentStopped": False}},
+            ]}},
+            "deploymentLogs(deploymentId:": {"deploymentLogs": [
+                {"timestamp": "2026-08-04T10:00:01Z", "message": "listening"}]},
+            "buildLogs(deploymentId:": {"errors": [{"message": "Not Authorized"}]},
+        })
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1", "build_logs": "always"})))
+
+        self.assertEqual(1, len(result["logs"]),
+                         "a failed extra query threw away the logs that worked")
+        self.assertNotIn("buildLogs", result)
+        self.assertIn("Not Authorized", result["buildLogsNote"])
+        self.assertTrue([c for c in session.calls
+                         if "buildLogs(deploymentId:" in c["query"]])
+
+
 class RefusalWordingTest(_StubbedServer):
     """Railway refuses anything the account cannot see with a flat "Not
     Authorized", whether the id is mistyped, stale, someone else's or genuinely

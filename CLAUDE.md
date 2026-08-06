@@ -71,8 +71,8 @@ py -3.12 -m venv .venv
 The suite is stdlib `unittest`, so there is no test framework to install, but it
 imports `server.py` and therefore needs `requirements.txt` installed. It needs no
 Railway credentials and never contacts the Railway API: it swaps `server._session`
-for a fake at the HTTP boundary and refuses any call that forgets to. **74 tests,
-0.68 s, verified 2026-08-06** on Python 3.12.10. `tests/README.md` explains what
+for a fake at the HTTP boundary and refuses any call that forgets to. **83 tests,
+0.57 s, verified 2026-08-06** on Python 3.12.10. `tests/README.md` explains what
 each class is protecting and why.
 
 GitHub Actions runs the same command on every push and pull request
@@ -139,6 +139,22 @@ cheapest liveness check.
   service is running must read that flag — trusting `status` reports a stopped
   service as healthy and a failed build's logs as the live ones. Tests pin this in
   `StopStartTest` and `LogProvenanceTest`.
+- **A deployment has two log queries, and the failure you care about is in the
+  other one.** `buildLogs(deploymentId:)` is the builder's output and
+  `deploymentLogs(deploymentId:)` is the container's. They take identical
+  arguments, return the same `[Log!]!`, and the dashboard shows them as two
+  tabs — so it is easy to write one and believe you covered both. A build that
+  fails never starts a container, so `deploymentLogs` is empty and the reason
+  exists only in `buildLogs`; until 2026-08-06 `get_logs` asked for the
+  container's alone and answered a failed production deploy with `logs: []`,
+  which reads as "Railway kept nothing" rather than "wrong query". Nothing else
+  hinted at it, because a CRASHED deployment — whose container did run — returns
+  a complete stack trace. `get_logs` now adds the build output whenever the
+  container printed nothing and the deployment is not merely a quiet
+  SUCCESS/SLEEPING one, with `buildLogsNote` saying which list to read;
+  `build_logs="always"|"never"` overrides that. The extra query is wrapped:
+  a Railway refusal on it must never cost the container logs that did arrive.
+  `BuildLogTest` pins both the fetch and the deliberate non-fetch.
 - **`list_services` cannot tell you whether a deploy landed.** Its
   `latestDeployment` is Railway's own per-instance pointer and it lags: during a
   real deploy it kept naming the previous deployment across three checks, still
