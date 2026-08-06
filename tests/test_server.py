@@ -32,6 +32,7 @@ import json
 import sys
 import time
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -1973,6 +1974,210 @@ class MissingServiceInstanceTest(_StubbedServer):
 
         self.assertNotIn("updated", result)
         self.assertIn("svc-pdf", result["error"])
+
+
+class ContainerLivenessTest(_StubbedServer):
+    """A service with no container must not read as healthy.
+
+    The defect this locks is the one that costs the most: a production Postgres
+    whose container had been gone for five months, described as fine by every
+    read tool. latestDeployment SUCCESS, deploymentStopped false, get_logs
+    reporting deploymentIsRunning TRUE beside an empty log array — three days of
+    outage that the tooling agreed was healthy, while the dependent API's
+    "connection timeout" was blamed on the network.
+
+    The status fields were not wrong so much as answering a different question:
+    which deployment the service is ON, never whether a process exists. So the
+    tests below are about the one signal that does answer it — resource usage —
+    and about not overclaiming with it: an accusation is made ONLY from samples
+    that exist and are all zero. No samples, a refused query, a young deployment
+    or a SLEEPING one must claim nothing, because a check that cries wolf is
+    ignored exactly like one that never fires. And a deployment that printed
+    logs is alive by definition, so it must not pay for the extra query at all.
+    """
+
+    _OLD = "2026-03-01T10:00:00Z"       # comfortably older than the age guard
+
+    def _routes(self, metrics, logs=(), status="SUCCESS", created=None):
+        return {
+            "deployments(input:": {"deployments": {"edges": [
+                {"node": {"id": "dep-1", "createdAt": created or self._OLD,
+                          "status": status, "deploymentStopped": False}},
+            ]}},
+            "deploymentLogs(": {"deploymentLogs": list(logs)},
+            "metrics(projectId:": metrics,
+        }
+
+    @staticmethod
+    def _flat_zero():
+        return {"metrics": [
+            {"measurement": "CPU_USAGE",
+             "values": [{"ts": 1, "value": 0}, {"ts": 2, "value": 0}]},
+            {"measurement": "MEMORY_USAGE_GB",
+             "values": [{"ts": 1, "value": 0}, {"ts": 2, "value": 0}]},
+        ]}
+
+    async def _logs(self, session_routes):
+        self.install(session_routes)
+        return json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1"})))
+
+    async def test_a_dead_container_is_not_reported_as_running(self):
+        """The incident itself: SUCCESS, not stopped, nothing printed, and every
+        CPU/memory sample zero. A running process cannot use zero memory, so the
+        answer must say the service is down instead of asserting it is up."""
+        result = await self._logs(self._routes(self._flat_zero()))
+
+        self.assertFalse(result["deploymentIsRunning"],
+                         "a service with no container is still reported as "
+                         "running — the field that misled the whole incident")
+        self.assertEqual("no-resource-use", result["containerCheck"]["verdict"])
+        self.assertIn("NO RUNNING CONTAINER", result["warning"])
+        self.assertEqual(["warning"], list(result)[:1],
+                         "the warning must lead the answer, not sit under the "
+                         "fields that look healthy")
+
+    async def test_a_quiet_but_live_service_is_still_running(self):
+        """The other half, and the one that keeps the check usable: a healthy
+        service can simply have nothing to say. Memory above zero settles it,
+        and no warning may fire."""
+        result = await self._logs(self._routes({"metrics": [
+            {"measurement": "CPU_USAGE", "values": [{"ts": 1, "value": 0}]},
+            {"measurement": "MEMORY_USAGE_GB", "values": [{"ts": 1, "value": 0.12}]},
+        ]}))
+
+        self.assertTrue(result["deploymentIsRunning"])
+        self.assertEqual("resource-use-seen", result["containerCheck"]["verdict"])
+        self.assertNotIn("warning", result)
+
+    async def test_no_samples_at_all_accuses_nobody(self):
+        """An empty metrics answer is also what an unavailable metrics backend
+        looks like. Reporting a live service as dead on that basis would make
+        the whole check something people learn to ignore."""
+        result = await self._logs(self._routes({"metrics": []}))
+
+        self.assertTrue(result["deploymentIsRunning"])
+        self.assertEqual("not-checked", result["containerCheck"]["verdict"])
+        self.assertNotIn("warning", result)
+
+    async def test_a_refused_metrics_query_costs_only_itself(self):
+        """Same rule as the build-log query: the extra check may never turn a
+        working answer into an error."""
+        routes = self._routes({"errors": [{"message": "Not Authorized"}]})
+        result = await self._logs(routes)
+
+        self.assertNotIn("error", result)
+        self.assertEqual("not-checked", result["containerCheck"]["verdict"])
+        self.assertTrue(result["deploymentIsRunning"])
+
+    async def test_a_deployment_that_printed_is_not_probed(self):
+        """Logs are proof of a container, so the second query would buy nothing.
+        The check must cost a round trip only where it can change the answer."""
+        session = self.install(self._routes(
+            self._flat_zero(), logs=[{"timestamp": "t", "message": "hello"}]))
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1"})))
+
+        self.assertTrue(result["deploymentIsRunning"])
+        self.assertNotIn("containerCheck", result)
+        self.assertFalse([c for c in session.calls if "metrics(" in c["query"]],
+                         "a service that is printing logs was probed anyway")
+
+    async def test_a_just_created_deployment_is_not_accused(self):
+        """A container that has only just started has not reported a sample yet,
+        so zero usage means nothing about it — and a deploy is exactly when
+        someone reads the logs."""
+        fresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        session = self.install(self._routes(self._flat_zero(), created=fresh))
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1"})))
+
+        self.assertTrue(result["deploymentIsRunning"])
+        self.assertEqual("not-checked", result["containerCheck"]["verdict"])
+        self.assertFalse([c for c in session.calls if "metrics(" in c["query"]])
+
+    async def test_a_sleeping_deployment_is_not_accused(self):
+        """Railway removes a sleeping app's container on purpose and says so in
+        the status. Zero usage is the correct state, not a fault."""
+        session = self.install(self._routes(self._flat_zero(), status="SLEEPING"))
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "get_logs", {"project_id": "p1", "environment_id": "e1",
+                         "service_id": "svc1"})))
+
+        self.assertEqual("not-checked", result["containerCheck"]["verdict"])
+        self.assertNotIn("warning", result)
+        self.assertFalse([c for c in session.calls if "metrics(" in c["query"]])
+
+    async def test_restart_falls_back_to_redeploy_when_nothing_is_running(self):
+        """Second finding of the same incident: deploymentRestart answered true
+        against the dead service and started nothing, three times over, while
+        start_service brought it straight back. A restart that cannot work must
+        use the mutation that does, and say which one it used."""
+        session = self.install({
+            "deployments(input:": {"deployments": {"edges": [
+                {"node": {"id": "dep-1", "createdAt": self._OLD, "status": "SUCCESS"}},
+            ]}},
+            "metrics(projectId:": self._flat_zero(),
+            "serviceInstanceRedeploy": {"serviceInstanceRedeploy": True},
+            "deploymentRestart": {"deploymentRestart": True},
+        })
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "deploy", {"project_id": "p1", "environment_id": "e1",
+                       "service_id": "svc1"})))
+
+        self.assertTrue(result["restarted"])
+        self.assertEqual("serviceInstanceRedeploy", result["method"])
+        self.assertEqual("no-resource-use", result["containerCheck"]["verdict"])
+        self.assertTrue([c for c in session.calls
+                         if "serviceInstanceRedeploy" in c["query"]])
+        self.assertFalse([c for c in session.calls
+                          if "deploymentRestart" in c["query"]],
+                         "restarted a deployment whose container is gone — the "
+                         "call Railway confirms and does not act on")
+
+    async def test_a_live_container_is_still_restarted_the_old_way(self):
+        """The fallback is for the dead case only. A service that is up must
+        keep getting the cheap in-place restart, with the answer callers already
+        parse."""
+        session = self.install({
+            "deployments(input:": {"deployments": {"edges": [
+                {"node": {"id": "dep-1", "createdAt": self._OLD, "status": "SUCCESS"}},
+            ]}},
+            "metrics(projectId:": {"metrics": [
+                {"measurement": "MEMORY_USAGE_GB", "values": [{"ts": 1, "value": 0.4}]},
+            ]},
+            "deploymentRestart": {"deploymentRestart": True},
+        })
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "deploy", {"project_id": "p1", "environment_id": "e1",
+                       "service_id": "svc1"})))
+
+        self.assertEqual({"deploymentId": "dep-1", "deploymentStatus": "SUCCESS",
+                          "restarted": True}, result)
+        self.assertFalse([c for c in session.calls
+                          if "serviceInstanceRedeploy" in c["query"]])
+
+    async def test_the_listing_admits_it_cannot_see_a_container(self):
+        """list_services is where the dead service was looked at first, and its
+        fields cannot answer this at any price — a per-instance metrics query
+        for every service would be unaffordable. So the description has to carry
+        the warning and name the tools that can."""
+        tools = {t.name: (t.description or "").lower()
+                 for t in await server.mcp.list_tools()}
+
+        self.assertIn("not proof of a running", tools["list_services"])
+        self.assertIn("get_metrics", tools["list_services"])
+        self.assertIn("containercheck", tools["get_logs"],
+                      "get_logs no longer documents the field that carries the "
+                      "evidence")
 
 
 async def _text(call) -> str:
