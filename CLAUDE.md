@@ -200,6 +200,22 @@ cheapest liveness check.
   payload would wipe a setting the caller never mentioned. Hence the split:
   `None` means untouched, `""` clears a string, `[]` clears a list and is sent
   as `[]` rather than collapsed to null. `ServiceConfigTest` pins all four.
+- **`serviceInstanceUpdate` does not object to a service instance that is not
+  there, so both setters have to look first.** Config belongs to the service
+  *instance* — one per environment — not to the service, so a service can exist
+  in the project and have no instance in the environment being configured.
+  Railway raises nothing for that: `set_service_config` answered `updated: true`
+  with a full `applied` block, and `set_start_command` the same, while the
+  settings were written nowhere; the next deploy then refused with "Service
+  Instance not found". Both now run `_instance_missing` first — the same
+  `serviceInstance` query `get_service_instance` uses — and refuse, naming both
+  ids, when it comes back null OR when Railway will not confirm it (its own
+  answer for this state is sometimes the GraphQL error "ServiceInstance not
+  found", sometimes a bare "Not Authorized" that hides whether the thing exists
+  at all). The mutation's Boolean result, previously discarded, is now checked
+  for an explicit `false` only, so a null or absent value behaves as before.
+  `MissingServiceInstanceTest` pins it. NB **`set_region` writes through the
+  same mutation and is still unguarded** — it has the same defect.
 - **`deploy` and `create_deployment` are not the same operation, and the
   confusion is silent.** `deploy` restarts the container already running and
   builds nothing, so an agent reaching for it sees a success and reports that new

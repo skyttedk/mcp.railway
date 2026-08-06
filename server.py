@@ -415,6 +415,61 @@ async def get_service_instance(environment_id: str, service_id: str) -> str:
     return json.dumps(data["serviceInstance"])
 
 
+# A service belongs to a project, but its deploy CONFIG belongs to a
+# service *instance* — one per environment. A service can therefore exist in
+# the project and have no instance in the environment being configured, and
+# `serviceInstanceUpdate` does not object: it answers without an error, the
+# settings are written nowhere, and the tool used to report `updated: true`
+# with the settings echoed back. The write is not merely lost, it is reported
+# as done — the caller only finds out at the next deploy, which refuses with
+# "Service Instance not found". So: confirm the instance first and refuse if
+# it is not there, exactly as delete_service confirms a service before firing.
+async def _instance_missing(environment_id: str, service_id: str,
+                            action: str) -> str | None:
+    """Return the refusal to send back, or None when the instance exists.
+
+    Two different failures are reported apart, because they need different
+    answers: Railway would not tell us (bad token, wrong account, outage) and
+    Railway told us there is nothing there. Both refuse — neither is a reason
+    to fire a write we cannot confirm landed.
+    """
+    try:
+        data = await _query("""query($sid: String!, $eid: String!) {
+          serviceInstance(serviceId: $sid, environmentId: $eid) {
+            serviceId serviceName
+          }
+        }""", {"sid": service_id, "eid": environment_id})
+    except RuntimeError as exc:
+        return json.dumps({
+            "error": f"Railway would not confirm service {service_id} in "
+                     f"environment {environment_id}: {exc}. Nothing was "
+                     f"changed — {action} looks the service instance up first "
+                     "and will not write settings it cannot read back."})
+    if not data.get("serviceInstance"):
+        return json.dumps({
+            "error": f"Service {service_id} has no instance in environment "
+                     f"{environment_id}, so there is nothing to configure "
+                     f"there. Nothing was changed. The service may exist in "
+                     "the project and only in OTHER environments — check "
+                     "list_services, whose `instances` name the environments "
+                     "it is actually in, or create it in this one with "
+                     "create_service."})
+    return None
+
+
+# Railway's serviceInstanceUpdate is a Boolean field. It is only inspected for
+# an explicit `false`, never for absence: a null or missing value is left to
+# behave exactly as it did when the result was discarded, so this can only add
+# a refusal, never invent one.
+def _update_rejected(data: dict, environment_id: str, service_id: str) -> str | None:
+    if data.get("serviceInstanceUpdate") is False:
+        return json.dumps({
+            "error": f"Railway rejected the update for service {service_id} in "
+                     f"environment {environment_id} (serviceInstanceUpdate "
+                     "returned false). Nothing was changed."})
+    return None
+
+
 @mcp.tool()
 async def set_region(environment_id: str, service_id: str, region: str,
                redeploy: bool = False) -> str:
@@ -447,11 +502,21 @@ async def set_start_command(environment_id: str, service_id: str, start_command:
 
     Pass an empty string to clear the override so the service falls back to
     its Dockerfile CMD / builder default. The change only takes effect on the
-    next deploy — pass redeploy=true to trigger one immediately."""
-    await _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
+    next deploy — pass redeploy=true to trigger one immediately.
+
+    Refuses, and writes nothing, when the service has no instance in that
+    environment — Railway accepts the write silently in that case, so the
+    instance is confirmed first."""
+    refusal = await _instance_missing(environment_id, service_id, "set_start_command")
+    if refusal:
+        return refusal
+    data = await _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
       serviceInstanceUpdate(serviceId: $sid, environmentId: $eid, input: $input)
     }""", {"sid": service_id, "eid": environment_id,
            "input": {"startCommand": start_command or None}})
+    rejected = _update_rejected(data, environment_id, service_id)
+    if rejected:
+        return rejected
     result: dict = {"serviceId": service_id, "environmentId": environment_id,
                     "startCommand": start_command or None, "updated": True,
                     "redeployed": False}
@@ -515,7 +580,11 @@ async def set_service_config(environment_id: str, service_id: str,
     - sleep_application — serverless-style sleep when idle.
 
     Like the other setters, changes take effect on the NEXT deploy — pass
-    redeploy=true to trigger one immediately."""
+    redeploy=true to trigger one immediately.
+
+    Refuses, and writes nothing, when the service has no instance in that
+    environment — Railway accepts the write silently in that case, so the
+    instance is confirmed first."""
     if builder and builder.upper() not in _BUILDERS:
         return json.dumps({"error": (
             f"builder must be one of {', '.join(_BUILDERS)} (got {builder!r}). "
@@ -563,9 +632,18 @@ async def set_service_config(environment_id: str, service_id: str,
             "restart_policy_type, restart_policy_max_retries, cron_schedule, "
             "sleep_application.")})
 
-    await _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
+    # After the local checks above, so a malformed or empty call is still
+    # answered without a round trip, and before the write, so a missing
+    # instance is refused instead of reported as applied.
+    refusal = await _instance_missing(environment_id, service_id, "set_service_config")
+    if refusal:
+        return refusal
+    data = await _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
       serviceInstanceUpdate(serviceId: $sid, environmentId: $eid, input: $input)
     }""", {"sid": service_id, "eid": environment_id, "input": payload})
+    rejected = _update_rejected(data, environment_id, service_id)
+    if rejected:
+        return rejected
     result: dict = {"serviceId": service_id, "environmentId": environment_id,
                     "applied": payload, "updated": True, "redeployed": False}
     if redeploy:
