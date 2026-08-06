@@ -1784,7 +1784,19 @@ class ServiceConfigTest(_StubbedServer):
     it to change the Dockerfile path silently wipes the healthcheck.
     """
 
-    _ROUTE = {"serviceInstanceUpdate": {"serviceInstanceUpdate": True}}
+    # The read half is answered too: both setters now confirm the service
+    # instance exists before writing, so every successful call makes two
+    # requests and the mutation is no longer calls[0].
+    _ROUTE = {"serviceInstanceUpdate": {"serviceInstanceUpdate": True},
+              "serviceInstance(serviceId": {
+                  "serviceInstance": {"serviceId": "svc1", "serviceName": "web"}}}
+
+    @staticmethod
+    def _sent(session: _FakeSession) -> dict:
+        """The input actually written, found by name rather than by position."""
+        writes = [c for c in session.calls if "serviceInstanceUpdate" in c["query"]]
+        assert len(writes) == 1, f"expected one write, got {len(writes)}"
+        return writes[0]["variables"]["input"]
 
     async def test_only_the_settings_passed_are_sent(self):
         session = self.install(self._ROUTE)
@@ -1795,7 +1807,7 @@ class ServiceConfigTest(_StubbedServer):
 
         self.assertTrue(result["updated"])
         self.assertEqual({"dockerfilePath": "docker/Dockerfile.web"},
-                         session.calls[0]["variables"]["input"],
+                         self._sent(session),
                          "an untouched setting was included and would be "
                          "overwritten on the service")
 
@@ -1807,8 +1819,7 @@ class ServiceConfigTest(_StubbedServer):
         await _text(server.mcp.call_tool("set_service_config", {
             "environment_id": "e1", "service_id": "svc1", "root_directory": ""}))
 
-        self.assertEqual({"rootDirectory": None},
-                         session.calls[0]["variables"]["input"])
+        self.assertEqual({"rootDirectory": None}, self._sent(session))
 
     async def test_an_empty_list_is_sent_as_a_list_not_as_null(self):
         """watchPatterns/preDeployCommand are list settings. Collapsing [] to
@@ -1818,8 +1829,7 @@ class ServiceConfigTest(_StubbedServer):
         await _text(server.mcp.call_tool("set_service_config", {
             "environment_id": "e1", "service_id": "svc1", "watch_patterns": []}))
 
-        self.assertEqual({"watchPatterns": []},
-                         session.calls[0]["variables"]["input"])
+        self.assertEqual({"watchPatterns": []}, self._sent(session))
 
     async def test_falsey_numbers_and_booleans_survive(self):
         """0 replicas and sleep_application=False are real values a caller may
@@ -1831,7 +1841,7 @@ class ServiceConfigTest(_StubbedServer):
             "num_replicas": 0, "sleep_application": False}))
 
         self.assertEqual({"numReplicas": 0, "sleepApplication": False},
-                         session.calls[0]["variables"]["input"])
+                         self._sent(session))
 
     async def test_an_unknown_builder_is_refused_before_the_call(self):
         """Railway takes `builder` as a GraphQL enum, so a bad value fails with
@@ -1864,13 +1874,105 @@ class ServiceConfigTest(_StubbedServer):
             "environment_id": "e1", "service_id": "svc1", "num_replicas": 2})))
         self.assertFalse(quiet["redeployed"])
         self.assertIn("next deploy", quiet["note"])
-        self.assertEqual(1, len(session.calls))
+        self.assertEqual([], [c for c in session.calls
+                              if "serviceInstanceRedeploy" in c["query"]])
 
         loud = json.loads(await _text(server.mcp.call_tool("set_service_config", {
             "environment_id": "e1", "service_id": "svc1", "num_replicas": 2,
             "redeploy": True})))
         self.assertTrue(loud["redeployed"])
         self.assertTrue([c for c in session.calls if "serviceInstanceRedeploy" in c["query"]])
+
+
+class MissingServiceInstanceTest(_StubbedServer):
+    """Regression: config writes reported success for an instance that was not
+    there.
+
+    A service lives in a project; its deploy config lives in a service
+    *instance*, one per environment. Told to configure a service in an
+    environment it has no instance in, Railway's serviceInstanceUpdate raised
+    nothing — so both setters answered `updated: true`, set_service_config even
+    echoing an `applied` block, while nothing was written anywhere. The caller
+    learned the truth only at the next deploy ("Service Instance not found"),
+    or never — read back, the settings were simply absent. A write that cannot
+    land must be refused, not reported as done.
+    """
+
+    _WRITE = {"serviceInstanceUpdate": {"serviceInstanceUpdate": True}}
+    _ABSENT = {**_WRITE, "serviceInstance(serviceId": {"serviceInstance": None}}
+    # Railway's own answer for the same state, seen from get_service_instance.
+    _NOT_FOUND = {**_WRITE, "serviceInstance(serviceId": {
+        "errors": [{"message": "ServiceInstance not found"}]}}
+
+    @staticmethod
+    def _writes(session: _FakeSession) -> list[dict]:
+        return [c for c in session.calls if "serviceInstanceUpdate" in c["query"]]
+
+    async def _call(self, tool: str, routes: dict) -> tuple[dict, _FakeSession]:
+        session = self.install(routes)
+        args = {"environment_id": "env-prod", "service_id": "svc-pdf"}
+        args.update({"set_start_command": {"start_command": "node serve.js"},
+                     "set_service_config": {"num_replicas": 2}}[tool])
+        return json.loads(await _text(server.mcp.call_tool(tool, args))), session
+
+    async def test_set_service_config_refuses_a_service_with_no_instance(self):
+        result, session = await self._call("set_service_config", self._ABSENT)
+
+        self.assertNotIn("updated", result,
+                         "a write that never happened was reported as done")
+        self.assertNotIn("applied", result,
+                         "settings were echoed back as applied but went nowhere")
+        self.assertIn("svc-pdf", result["error"])
+        self.assertIn("env-prod", result["error"],
+                      "the refusal must name the environment — the service does "
+                      "exist, just not there")
+        self.assertEqual([], self._writes(session))
+
+    async def test_set_start_command_refuses_a_service_with_no_instance(self):
+        result, session = await self._call("set_start_command", self._ABSENT)
+
+        self.assertNotIn("updated", result)
+        self.assertIn("svc-pdf", result["error"])
+        self.assertIn("env-prod", result["error"])
+        self.assertEqual([], self._writes(session))
+
+    async def test_railways_own_not_found_is_a_refusal_too(self):
+        """Railway answers this state with a GraphQL error rather than a null,
+        depending on how the pair is wrong. Both mean the same thing here."""
+        for tool in ("set_service_config", "set_start_command"):
+            with self.subTest(tool=tool):
+                result, session = await self._call(tool, self._NOT_FOUND)
+
+                self.assertNotIn("updated", result)
+                self.assertIn("svc-pdf", result["error"])
+                self.assertEqual([], self._writes(session))
+
+    async def test_an_existing_instance_is_still_written(self):
+        """The guard must refuse the missing case only — the working path is
+        the whole point of the tools."""
+        present = {**self._WRITE, "serviceInstance(serviceId": {
+            "serviceInstance": {"serviceId": "svc-pdf", "serviceName": "pdf"}}}
+
+        for tool in ("set_service_config", "set_start_command"):
+            with self.subTest(tool=tool):
+                result, session = await self._call(tool, present)
+
+                self.assertTrue(result["updated"])
+                self.assertEqual(1, len(self._writes(session)))
+
+    async def test_a_rejected_mutation_is_not_reported_as_updated(self):
+        """The result of the write used to be discarded outright. Only an
+        explicit false is treated as a rejection, so a null or missing value
+        keeps behaving exactly as it did."""
+        rejected = {"serviceInstanceUpdate": {"serviceInstanceUpdate": False},
+                    "serviceInstance(serviceId": {
+                        "serviceInstance": {"serviceId": "svc-pdf",
+                                            "serviceName": "pdf"}}}
+
+        result, _ = await self._call("set_service_config", rejected)
+
+        self.assertNotIn("updated", result)
+        self.assertIn("svc-pdf", result["error"])
 
 
 async def _text(call) -> str:
