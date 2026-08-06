@@ -119,15 +119,21 @@ cheapest liveness check.
   dependency that could move. `uvicorn` and `starlette` are used only inside the
   `__main__` block and do still come from `mcp`; that is the deliberate line
   between the two.
-- **`RAILWAY_PROJECT_ID` on the riskwave service points somewhere its own token
-  cannot see.** `DEFAULT_PROJECT` reads that variable, so any tool called without
-  an explicit `project_id` falls back to it — but Railway *injects*
-  `RAILWAY_PROJECT_ID` automatically with the id of the project the container is
-  hosted in, which is `mcp servers` on the **skyttedk** account for both services.
-  The riskwave instance's `RAILWAY_API_TOKEN` belongs to the riskwave account and
-  cannot read that project, so `railway_riskwave_*` calls that omit `project_id`
-  fail with `Not Authorized` (verified 2026-08-05). Pass `project_id` explicitly
-  to the riskwave namespace; the default is only useful on the skyttedk one.
+- **`RAILWAY_PROJECT_ID` is Railway's name, not ours — pin a default with
+  `MCP_DEFAULT_PROJECT_ID`.** Railway *injects* `RAILWAY_PROJECT_ID` into every
+  container with the id of the project the service is hosted in — `mcp servers`
+  on the **skyttedk** account for both services — and rewrites it on each build,
+  so a service-level variable of that name is stored but permanently shadowed
+  (tried on the live riskwave service, shadowed after both a restart and a full
+  rebuild; verified 2026-08-06). The riskwave instance's `RAILWAY_API_TOKEN`
+  belongs to the riskwave account and cannot read that project, so every
+  `railway_riskwave_*` call that omitted `project_id` fell back to it and failed
+  with `Not Authorized`. `DEFAULT_PROJECT` now reads `MCP_DEFAULT_PROJECT_ID`
+  first and only falls back to the reserved name, which is what keeps the
+  skyttedk service — which pins nothing — working exactly as before. Deploy-side:
+  the riskwave service needs `MCP_DEFAULT_PROJECT_ID` set to the `riskwave-app`
+  project id (`7b8d2d41-8854-4742-bfff-dbfd946c2202`, chosen by the owner
+  2026-08-06); until it is, pass `project_id` explicitly to that namespace.
 - **Railway's `Not Authorized` usually is not a permissions problem.** It is what
   the API answers when an id is not recognised *on the account the token belongs
   to* — most often a project or service id from the other account. `_annotate_refusal`
