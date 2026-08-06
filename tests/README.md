@@ -154,6 +154,27 @@ where it is not, since the skyttedk service pins nothing and honouring only the
 new name would silently take its default away. An empty value counts as absent,
 because Railway hands an unset variable through as `""`.
 
+And one class for whether a container exists at all (`ContainerLivenessTest`),
+because this failure does not look like a failure from any angle the tools
+offered. A production Postgres lost its container and kept `latestDeployment`
+SUCCESS, `deploymentStopped` false and `deploymentIsRunning` true beside an
+empty log array for five months; the dependent API had been unable to connect
+for three days and the outage read as healthy the whole time. The status fields
+were not lying so much as answering a different question — which deployment the
+service is on, never whether a process exists — so the fix is the one signal
+that does answer it: a live container cannot use zero memory. The tests hold
+`get_logs` to reporting the service DOWN when every CPU and memory sample in the
+window is zero, and, with at least as much weight, to accusing nobody otherwise:
+no samples at all (which is also what a broken metrics backend looks like), a
+metrics query Railway refused, a deployment younger than the probe's age guard
+and a SLEEPING one must each claim nothing, and a deployment that printed logs
+must not even pay for the extra query. A check that cries wolf is ignored
+exactly like one that never fires. Two more cover the same incident's second
+half: `deploymentRestart` answered true against the dead service and started
+nothing, so `deploy` must fall back to the mutation `start_service` uses when
+the container is gone — and must keep the old, cheap in-place restart, answer
+included, when it is not.
+
 ## After an intended change to a tool's arguments
 
 The contract test fails on purpose. Confirm the change is wanted, then:

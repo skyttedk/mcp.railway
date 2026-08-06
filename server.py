@@ -333,6 +333,16 @@ async def list_services(project_id: str = "") -> str:
     removed shows up nowhere else — which is exactly how a service ends up
     forgotten. latestDeployment null means the service has never deployed.
 
+    A SUCCESSFUL, UNSTOPPED DEPLOYMENT IS STILL NOT PROOF OF A RUNNING
+    CONTAINER. These fields describe the deployment, not the process: a service
+    whose container has gone away keeps latestDeployment SUCCESS and
+    deploymentStopped false indefinitely, and nothing here tells it apart from a
+    healthy one — a production database sat dead for five months that way. When
+    the question is whether something is actually up, call get_logs (it checks
+    resource usage when the running deployment has printed nothing, and reports
+    `containerCheck`) or read get_metrics directly: memory flat at zero means no
+    container.
+
     DO NOT USE THIS TO CONFIRM THAT A DEPLOY LANDED. `latestDeployment` is
     Railway's own per-instance pointer, and it has been seen naming the
     PREVIOUS deployment for the whole of a deploy — still stale well after the
@@ -824,6 +834,124 @@ def _running_deployment(nodes: list[dict]) -> dict | None:
                 None)
 
 
+# ── a deployment status is not a container ───────────────────────────
+#
+# _running_deployment answers "which of these deployments is the one the
+# service is on" — a question about the DEPLOYMENT LIST, and the only question
+# Railway's deployment fields can answer. It cannot answer "does a container
+# exist", and for five months in 2026 a production Postgres proved the two are
+# different: latestDeployment SUCCESS, deploymentStopped false, get_logs
+# reporting deploymentIsRunning true, and no container anywhere. Every status
+# field agreed, the dependent API had been unable to connect for three days,
+# and the outage read as healthy through the whole tool surface.
+#
+# What did reveal it was resource usage: CPU and memory flat at zero across
+# every sample. A live container cannot use zero memory — a process that exists
+# occupies some — so a window of samples that are all zero is positive evidence
+# of absence, and it is the cheapest such evidence Railway's API offers (one
+# metrics query, the same one get_metrics uses). A TCP/protocol probe settles it
+# harder but needs a public address, a protocol implementation per service type
+# and a real connection attempt; that does not belong in a general read tool.
+#
+# The probe is deliberately three-valued, and only one value is an accusation:
+#   resource-use-seen — a non-zero sample. The container is up. Certain.
+#   no-resource-use   — samples exist for the window and every one is zero.
+#                       Nothing is running. This is the incident's signature.
+#   not-checked       — no samples at all, a metrics query Railway refused, a
+#                       deployment too young to have reported yet, or a
+#                       SLEEPING one (which has no container BY DESIGN and says
+#                       so in its status). Nothing is claimed either way.
+# "No samples" stays not-checked on purpose: it is also what an unavailable
+# metrics backend looks like, and a health check that cries wolf gets ignored
+# exactly like one that never fires.
+_CONTAINER_PROBE_WINDOW_SECONDS = 1800
+
+# A container that has only just started has not reported a sample yet, so a
+# fresh deployment would probe as zero and be accused of not running. Below
+# this age the probe declines to answer instead.
+_CONTAINER_PROBE_MIN_AGE_SECONDS = 600
+
+_CONTAINER_PROBE_MEASUREMENTS = ("CPU_USAGE", "MEMORY_USAGE_GB")
+
+
+async def _container_probe(project_id: str, environment_id: str, service_id: str,
+                           deployment: dict) -> dict:
+    """Does this service actually have a container? Evidence, not status.
+
+    Reads the last half hour of CPU and memory samples and reports what it
+    found. Never raises: a probe that cannot run returns "not-checked", because
+    it exists to add certainty to an answer and must never be able to take the
+    answer away.
+    """
+    if deployment.get("status") == "SLEEPING":
+        return {"verdict": "not-checked",
+                "reason": "The deployment is SLEEPING, which means Railway has "
+                          "removed its container on purpose. Zero resource use "
+                          "is the correct state and proves nothing."}
+
+    now = datetime.now(timezone.utc)
+    created = _epoch(deployment.get("createdAt") or "")
+    if created is not None and now.timestamp() - created < _CONTAINER_PROBE_MIN_AGE_SECONDS:
+        return {"verdict": "not-checked",
+                "reason": f"The deployment was created less than "
+                          f"{_CONTAINER_PROBE_MIN_AGE_SECONDS // 60} minutes ago; a "
+                          "container that has just started has not reported usage "
+                          "yet, so zero samples would mean nothing."}
+
+    start = datetime.fromtimestamp(
+        now.timestamp() - _CONTAINER_PROBE_WINDOW_SECONDS, timezone.utc)
+    try:
+        data = await _query("""query($pid: String!, $eid: String!, $sid: String!,
+                              $start: DateTime!, $measurements: [MetricMeasurement!]!) {
+          metrics(projectId: $pid, environmentId: $eid, serviceId: $sid,
+                  startDate: $start, measurements: $measurements,
+                  groupBy: [DEPLOYMENT_ID]) {
+            measurement
+            values { ts value }
+          }
+        }""", {
+            "pid": project_id, "eid": environment_id, "sid": service_id,
+            "start": start.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "measurements": list(_CONTAINER_PROBE_MEASUREMENTS),
+        })
+    except RuntimeError as exc:
+        return {"verdict": "not-checked",
+                "reason": f"Railway would not answer the metrics query: {exc}"}
+
+    maxima: dict[str, float] = {}
+    samples = 0
+    for one in data.get("metrics") or []:
+        numbers = [v["value"] for v in (one.get("values") or [])
+                   if isinstance(v.get("value"), (int, float))]
+        if not numbers:
+            continue
+        samples += len(numbers)
+        name = one.get("measurement") or "UNKNOWN"
+        maxima[name] = max(maxima.get(name, 0.0), max(numbers))
+
+    if not samples:
+        return {"verdict": "not-checked",
+                "windowSeconds": _CONTAINER_PROBE_WINDOW_SECONDS,
+                "samples": 0,
+                "reason": "Railway returned no CPU or memory samples for this "
+                          "service over the window. That is also what an "
+                          "unavailable metrics backend looks like, so it is not "
+                          "taken as proof either way."}
+
+    verdict = "resource-use-seen" if any(v > 0 for v in maxima.values()) else "no-resource-use"
+    probe = {"verdict": verdict,
+             "windowSeconds": _CONTAINER_PROBE_WINDOW_SECONDS,
+             "samples": samples,
+             "maxima": maxima}
+    if verdict == "no-resource-use":
+        probe["reason"] = (
+            f"Every one of the {samples} CPU and memory samples Railway has for "
+            f"the last {_CONTAINER_PROBE_WINDOW_SECONDS // 60} minutes is zero. A "
+            "running container cannot use zero memory, so nothing is running — "
+            "whatever the deployment status says.")
+    return probe
+
+
 # ── build logs are a different query, and the one that explains a failed build ──
 #
 # Railway keeps a deployment's output in two places: buildLogs(deploymentId) is
@@ -870,6 +998,17 @@ async def get_logs(project_id: str, environment_id: str, service_id: str,
     `deploymentIsRunning`, and when it is false it leads with a `warning` naming
     both deployments. When the logs ARE the running deployment's, there is no
     warning and nothing extra to read past.
+
+    A DEPLOYMENT STATUS IS NOT A CONTAINER, so `deploymentIsRunning` is not
+    decided by status alone. When the running deployment has printed nothing,
+    the last half hour of CPU and memory samples is checked as well, and the
+    result is reported in `containerCheck`. All-zero usage means no container
+    exists — a running process cannot use zero memory — so `deploymentIsRunning`
+    comes back FALSE with a warning, however green the deployment looks. That is
+    the case a SUCCESS status hides completely: a service dead for months reads
+    as healthy through every status field. No samples at all, a refused metrics
+    query, a deployment younger than ten minutes or a SLEEPING one claim
+    nothing either way.
 
     source:
       "latest"  (default, unchanged behaviour) — the most recent deployment,
@@ -934,9 +1073,29 @@ async def get_logs(project_id: str, environment_id: str, service_id: str,
       }
     }""", {"did": target["id"], "limit": limit})
 
-    result: dict = {}
+    container_logs = data.get("deploymentLogs", [])
     is_running = running is not None and running["id"] == target["id"]
-    if not is_running:
+
+    # A deployment that is printing has a container by definition, so the probe
+    # is only worth its round trip on the answer that would otherwise be an
+    # unexplained silence: the running deployment, saying nothing. That is
+    # precisely the shape the dead Postgres had.
+    probe = None
+    if is_running and not container_logs:
+        probe = await _container_probe(project_id, environment_id, service_id, target)
+        if probe["verdict"] == "no-resource-use":
+            is_running = False
+
+    result: dict = {}
+    if probe is not None and probe["verdict"] == "no-resource-use":
+        result["warning"] = (
+            f"This service has NO RUNNING CONTAINER, even though deployment "
+            f"{target['id']} is {target['status']} and is not flagged stopped. "
+            f"{probe['reason']} `logs` is empty for the same reason: there is "
+            "nothing running to print anything. Nothing is serving traffic — "
+            "use start_service to bring it back up, and get_metrics for the "
+            "full picture.")
+    elif not is_running:
         if running is None:
             result["warning"] = (
                 f"These logs are NOT from a running deployment. They come from "
@@ -959,10 +1118,11 @@ async def get_logs(project_id: str, environment_id: str, service_id: str,
         "deploymentCreatedAt": target["createdAt"],
         "deploymentIsRunning": is_running,
     })
-    if not is_running:
+    if probe is not None:
+        result["containerCheck"] = probe
+    elif not is_running:
         result["runningDeploymentId"] = running["id"] if running else None
         result["runningDeploymentStatus"] = running["status"] if running else None
-    container_logs = data.get("deploymentLogs", [])
     result["logs"] = container_logs
 
     want_build = build_logs == "always" or (
@@ -1195,6 +1355,16 @@ async def deploy(project_id: str, environment_id: str, service_id: str) -> str:
     happily. So resolve the service's newest restartable deployment first, with
     the same deployments(DeploymentListInput) lookup get_logs uses, and restart
     that.
+
+    A CONTAINER THAT IS ALREADY GONE CANNOT BE RESTARTED. deploymentRestart
+    answers true for such a deployment and starts nothing, which is how a dead
+    service was "restarted" repeatedly while staying dead. So when the target
+    deployment shows no CPU or memory use at all, this falls back to
+    serviceInstanceRedeploy — the mutation start_service uses, which addresses
+    the service rather than a deployment and does bring it back. It redeploys
+    the same commit the service is already on, so still no new code; the answer
+    says which mutation ran, in `method`, and carries the evidence in
+    `containerCheck`.
     """
     deployments = await _query("""query($input: DeploymentListInput!) {
       deployments(input: $input, first: 10) {
@@ -1216,6 +1386,35 @@ async def deploy(project_id: str, environment_id: str, service_id: str) -> str:
                      "deployment that is running (or crashed/sleeping); deploy "
                      "the service first.",
             "recentStatuses": [d["status"] for d in nodes[:5]],
+        })
+
+    probe = await _container_probe(project_id, environment_id, service_id, target)
+    if probe["verdict"] == "no-resource-use":
+        try:
+            data = await _query("""mutation($sid: String!, $eid: String!) {
+              serviceInstanceRedeploy(serviceId: $sid, environmentId: $eid)
+            }""", {"sid": service_id, "eid": environment_id})
+        except RuntimeError as exc:
+            return json.dumps({
+                "error": f"This service has no running container to restart, and "
+                         f"Railway refused to redeploy service {service_id} in "
+                         f"environment {environment_id}: {exc}",
+                "containerCheck": probe,
+                "hint": "Both ids must belong to the same project — service ids "
+                        "come from list_services, environment ids from "
+                        "list_environments.",
+            })
+        return json.dumps({
+            "deploymentId": target["id"],
+            "deploymentStatus": target["status"],
+            "restarted": data.get("serviceInstanceRedeploy"),
+            "method": "serviceInstanceRedeploy",
+            "containerCheck": probe,
+            "note": "Restarted the SERVICE, not the deployment: the deployment "
+                    "is flagged as running but has no container, and "
+                    "deploymentRestart answers true for such a deployment "
+                    "while starting nothing. Same commit, no build. Confirm "
+                    "with get_metrics that usage has left zero.",
         })
 
     data = await _query("""mutation($did: String!) {

@@ -145,6 +145,27 @@ cheapest liveness check.
   service is running must read that flag — trusting `status` reports a stopped
   service as healthy and a failed build's logs as the live ones. Tests pin this in
   `StopStartTest` and `LogProvenanceTest`.
+- **No deployment field can tell you a container exists.** `deploymentStopped`
+  covers the deliberate case only. A container that simply went away leaves
+  `latestDeployment` on `SUCCESS`, `deploymentStopped` false and every read tool
+  agreeing the service is fine — a production Postgres sat dead for five months
+  that way, with three days of downstream outage blamed on network timing (card
+  2026-08-06). The only cheap evidence Railway offers is resource usage: a live
+  container cannot use zero memory, so a window of CPU/memory samples that are
+  all zero proves absence. `_container_probe` reads the last 30 minutes and is
+  deliberately three-valued — `resource-use-seen`, `no-resource-use`, and
+  `not-checked` for no samples at all, a refused query, a deployment under ten
+  minutes old or a `SLEEPING` one. **Only all-zero-samples accuses**: an empty
+  metrics answer is also what an unavailable metrics backend looks like, and a
+  check that cries wolf is ignored exactly like one that never fires. `get_logs`
+  runs it only when the running deployment printed nothing (logs are proof of a
+  container, so probing then buys nothing) and reports `containerCheck`,
+  flipping `deploymentIsRunning` to false on the evidence. Same incident, second
+  half: `deploymentRestart` answers `true` for a deployment whose container is
+  gone and starts nothing, so `deploy()` falls back to `serviceInstanceRedeploy`
+  — what `start_service` uses, and what actually brought the service back — and
+  names the mutation it used in `method`. `ContainerLivenessTest` pins the
+  accusation, every non-accusation, and both restart paths.
 - **A deployment has two log queries, and the failure you care about is in the
   other one.** `buildLogs(deploymentId:)` is the builder's output and
   `deploymentLogs(deploymentId:)` is the container's. They take identical
