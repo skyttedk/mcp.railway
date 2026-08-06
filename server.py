@@ -17,12 +17,37 @@ from mcp.server.fastmcp import FastMCP
 
 TOKEN = os.getenv("RAILWAY_API_TOKEN", "")
 API = "https://backboard.railway.com/graphql/v2"
-DEFAULT_PROJECT = os.getenv("RAILWAY_PROJECT_ID", "")
+# RAILWAY_PROJECT_ID is a name Railway RESERVES. The platform injects it into
+# every container with the id of the project the service is HOSTED in, and it
+# overwrites a service-level variable of the same name on the next build — so it
+# can never carry an operator's choice. On the riskwave instance the hosting
+# project is `mcp servers` on the *skyttedk* account, which the riskwave token
+# cannot read, so every call that omitted project_id fell back to it and failed
+# with "Not Authorized". Setting the reserved name to the wanted project was
+# tried and provably shadowed (verified 2026-08-06, restart AND full rebuild).
+# MCP_DEFAULT_PROJECT_ID is our own, unreserved, and is therefore the only name
+# that can actually pin a default. The reserved one stays as the fallback so an
+# instance that never sets ours behaves exactly as before.
+def _pinned_default_project(env=None) -> tuple[str, str]:
+    """Return (project id, name of the variable it came from).
+
+    Ours wins; Railway's reserved name is only the fallback, so an instance
+    that sets neither, or only the reserved one, is unaffected. The variable
+    name is returned rather than assumed because "the default is wrong" has
+    two completely different answers depending on which of the two supplied it.
+    """
+    env = os.environ if env is None else env
+    ours = env.get("MCP_DEFAULT_PROJECT_ID", "")
+    if ours:
+        return ours, "MCP_DEFAULT_PROJECT_ID"
+    return env.get("RAILWAY_PROJECT_ID", ""), "RAILWAY_PROJECT_ID"
+
+DEFAULT_PROJECT, DEFAULT_PROJECT_VAR = _pinned_default_project()
 
 mcp = FastMCP("railway")
 
 def _pid(project_id: str = "") -> str:
-    """Return project_id or default from env."""
+    """Return project_id or the pinned default (MCP_DEFAULT_PROJECT_ID)."""
     return project_id or DEFAULT_PROJECT
 
 _thread_state = threading.local()
@@ -166,10 +191,10 @@ async def whoami() -> str:
 async def list_projects() -> str:
     """List all Railway projects the token can access.
 
-    When the lookup fails but RAILWAY_PROJECT_ID is set, that one project is
-    still returned — carrying a `warning` naming what went wrong, so a dead
-    token or a Railway outage stays visible instead of being masked by the
-    pinned id.
+    When the lookup fails but a default project is pinned
+    (MCP_DEFAULT_PROJECT_ID), that one project is still returned — carrying a
+    `warning` naming what went wrong, so a dead token or a Railway outage stays
+    visible instead of being masked by the pinned id.
     """
     # One round trip: workspaces AND their projects in a single query.
     #
@@ -226,12 +251,12 @@ async def list_projects() -> str:
         return json.dumps(result)
 
     # Nothing found. If an attempt actually FAILED, that failure is the answer:
-    # blaming a missing RAILWAY_PROJECT_ID here sends the reader after a
+    # blaming a missing default project here sends the reader after a
     # configuration problem that does not exist, while an outage or an expired
     # token never surfaces anywhere. The config message below is correct only
     # when every query succeeded and simply had nothing to return.
     #
-    # A pinned RAILWAY_PROJECT_ID is a usable answer and stays the answer — the
+    # A pinned default project is a usable answer and stays the answer — the
     # caller gets a project rather than an error, which is the right trade. But
     # returning it alone says nothing about HOW we got here: one pinned project
     # satisfies whoever asked just as well whether the wider lookup found
@@ -241,7 +266,7 @@ async def list_projects() -> str:
     # a second element would look like a project that does not exist, and an
     # object would break every caller that iterates this.
     if DEFAULT_PROJECT:
-        pinned = {"id": DEFAULT_PROJECT, "name": "(from RAILWAY_PROJECT_ID)"}
+        pinned = {"id": DEFAULT_PROJECT, "name": f"(from {DEFAULT_PROJECT_VAR})"}
         if failures:
             pinned["warning"] = _could_not_list(failures)
             pinned["attempts"] = failures
@@ -249,7 +274,7 @@ async def list_projects() -> str:
     if failures:
         return json.dumps({"error": _could_not_list(failures),
                            "attempts": failures})
-    return json.dumps({"error": "Token cannot list projects. Set RAILWAY_PROJECT_ID or use a less-scoped token.",
+    return json.dumps({"error": "Token cannot list projects. Set MCP_DEFAULT_PROJECT_ID or use a less-scoped token.",
                        "workspaces": [{"id": w["id"], "name": w["name"]} for w in workspaces]})
 
 @mcp.tool()
@@ -291,7 +316,8 @@ async def create_project(name: str, description: str = "", workspace_id: str = "
 
 @mcp.tool()
 async def list_services(project_id: str = "") -> str:
-    """List services in a Railway project (uses RAILWAY_PROJECT_ID if empty).
+    """List services in a Railway project (uses the pinned default project,
+    MCP_DEFAULT_PROJECT_ID, if empty).
 
     Each service includes its per-environment `instances` with the region
     override; region null means the service runs in Railway's default region
@@ -321,7 +347,8 @@ async def list_services(project_id: str = "") -> str:
     deploymentIsRunning."""
     pid = _pid(project_id)
     if not pid:
-        return json.dumps({"error": "No project_id provided and RAILWAY_PROJECT_ID not set"})
+        return json.dumps({"error": "No project_id provided and no default project pinned "
+                                    "(set MCP_DEFAULT_PROJECT_ID on the service)"})
     data = await _query("""query($id: String!) {
       project(id: $id) { services { edges { node {
         id
@@ -1368,8 +1395,9 @@ async def delete_service(service_id: str = "", name: str = "",
         if not pid:
             return json.dumps({
                 "error": f"Cannot look up the service named {name!r}: no project_id "
-                         "given and RAILWAY_PROJECT_ID is not set. Pass project_id, "
-                         "or pass service_id and skip the name lookup entirely."})
+                         "given and no default project is pinned "
+                         "(MCP_DEFAULT_PROJECT_ID). Pass project_id, or pass "
+                         "service_id and skip the name lookup entirely."})
         data = await _query("""query($id: String!) {
           project(id: $id) { services { edges { node { id name } } } }
         }""", {"id": pid})
@@ -1600,7 +1628,8 @@ async def update_service_domain(environment_id: str, service_id: str,
 
 @mcp.tool()
 async def list_volumes(project_id: str = "") -> str:
-    """List persistent volumes in a project (uses RAILWAY_PROJECT_ID if empty).
+    """List persistent volumes in a project (uses the pinned default project,
+    MCP_DEFAULT_PROJECT_ID, if empty).
 
     A volume is project-scoped; its per-environment attachments are the
     `instances`, each carrying the mount path, size and the service it is
@@ -1608,7 +1637,8 @@ async def list_volumes(project_id: str = "") -> str:
     volume's `id` for delete_volume/update_volume_mount."""
     pid = _pid(project_id)
     if not pid:
-        return json.dumps({"error": "No project_id provided and RAILWAY_PROJECT_ID not set"})
+        return json.dumps({"error": "No project_id provided and no default project pinned "
+                                    "(set MCP_DEFAULT_PROJECT_ID on the service)"})
     data = await _query("""query($id: String!) {
       project(id: $id) { volumes { edges { node {
         id

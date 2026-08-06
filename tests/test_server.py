@@ -837,7 +837,7 @@ class DeleteServiceTest(_StubbedServer):
 class ListProjectsFailureTest(_StubbedServer):
     """list_projects tries a fast path and two fallbacks. Each swallows its own
     exception so the next one runs — correct — but when all of them come up
-    empty the reader used to be told to set RAILWAY_PROJECT_ID, whatever had
+    empty the reader used to be told to pin a default project, whatever had
     actually gone wrong. An outage, an expired token and a genuinely unscoped
     token all looked identical, and the real cause appeared nowhere.
 
@@ -847,7 +847,7 @@ class ListProjectsFailureTest(_StubbedServer):
 
     def setUp(self):
         # These tests are about the no-project-id branch, and a developer
-        # machine may well have RAILWAY_PROJECT_ID set.
+        # machine may well have a default project pinned.
         original = server.DEFAULT_PROJECT
         server.DEFAULT_PROJECT = ""
         self.addCleanup(setattr, server, "DEFAULT_PROJECT", original)
@@ -910,7 +910,7 @@ class ListProjectsFailureTest(_StubbedServer):
 
         result = json.loads(await _text(server.mcp.call_tool("list_projects", {})))
 
-        self.assertIn("RAILWAY_PROJECT_ID", result["error"])
+        self.assertIn("MCP_DEFAULT_PROJECT_ID", result["error"])
         self.assertEqual([], result["workspaces"])
         self.assertNotIn("attempts", result,
                          "nothing failed, so there is no failure to report")
@@ -931,7 +931,7 @@ class ListProjectsFailureTest(_StubbedServer):
 class ListProjectsPinnedProjectTest(_StubbedServer):
     """The failure reason above only reaches a caller who got nothing back.
 
-    With RAILWAY_PROJECT_ID set, the pinned project satisfies the request and
+    With a default project pinned, that project satisfies the request and
     the recorded failures were dropped — so a caller could not tell "the
     account holds one project" from "everything failed and one id was
     configured". An expiring token then goes unnoticed for as long as that one
@@ -948,6 +948,11 @@ class ListProjectsPinnedProjectTest(_StubbedServer):
         original = server.DEFAULT_PROJECT
         server.DEFAULT_PROJECT = self.PINNED
         self.addCleanup(setattr, server, "DEFAULT_PROJECT", original)
+        # The name is reported, not assumed, so pin it too — otherwise this
+        # test reads whatever the developer's own environment happens to hold.
+        original_var = server.DEFAULT_PROJECT_VAR
+        server.DEFAULT_PROJECT_VAR = "MCP_DEFAULT_PROJECT_ID"
+        self.addCleanup(setattr, server, "DEFAULT_PROJECT_VAR", original_var)
 
     @staticmethod
     def _http(status: int) -> requests.exceptions.HTTPError:
@@ -974,7 +979,8 @@ class ListProjectsPinnedProjectTest(_StubbedServer):
         self.assertIsInstance(result, list, "the answer stopped being a list of projects")
         self.assertEqual(1, len(result), "the pinned project gained or lost company")
         self.assertEqual(self.PINNED, result[0]["id"], "the usable answer was dropped")
-        self.assertIn("RAILWAY_PROJECT_ID", result[0]["name"])
+        self.assertIn("MCP_DEFAULT_PROJECT_ID", result[0]["name"],
+                      "the answer no longer says where the pinned id came from")
 
     async def test_the_pinned_project_says_the_wider_lookup_failed_and_why(self):
         """The defect: one project came back and the 401 behind it vanished."""
@@ -1033,6 +1039,57 @@ class ListProjectsPinnedProjectTest(_StubbedServer):
         self.assertIn("warning", result[0])
         self.assertNotIn("super-secret-token", json.dumps(result))
         self.assertIn("***", result[0]["warning"])
+
+
+class DefaultProjectSourceTest(unittest.TestCase):
+    """Which variable the default project may be read from.
+
+    RAILWAY_PROJECT_ID is a name Railway reserves: the platform injects it into
+    every container with the id of the project the service is HOSTED in, and it
+    overwrites a service-level variable of the same name on the next build. On
+    the riskwave instance that hosting project sits on the other account, so
+    every call that omitted project_id fell back to a project its own token
+    cannot read and answered "Not Authorized". Pinning the reserved name to the
+    wanted project was tried on the live service and provably shadowed — which
+    is why the operator's default now has a name of ours that nothing else
+    writes.
+
+    Both halves matter. Ours must win where it is set, and the reserved one
+    must keep working where it is not: the skyttedk instance pins nothing and
+    relies on the injected value, so a change that only honoured the new name
+    would quietly take its default away.
+    """
+
+    def test_our_variable_wins_over_the_reserved_one(self):
+        """The fix itself — set on the same service, ours is the answer."""
+        pid, source = server._pinned_default_project(
+            {"MCP_DEFAULT_PROJECT_ID": "ours", "RAILWAY_PROJECT_ID": "railways"})
+
+        self.assertEqual("ours", pid, "the platform's injected value won again")
+        self.assertEqual("MCP_DEFAULT_PROJECT_ID", source)
+
+    def test_the_reserved_one_is_still_used_when_ours_is_absent(self):
+        """Today's behaviour for every deployment that sets nothing new."""
+        pid, source = server._pinned_default_project({"RAILWAY_PROJECT_ID": "railways"})
+
+        self.assertEqual("railways", pid)
+        self.assertEqual("RAILWAY_PROJECT_ID", source)
+
+    def test_an_empty_value_of_ours_does_not_shadow_the_fallback(self):
+        """Railway hands an unset variable through as an empty string, so
+        "" must read as absent rather than as a deliberate blank default."""
+        pid, source = server._pinned_default_project(
+            {"MCP_DEFAULT_PROJECT_ID": "", "RAILWAY_PROJECT_ID": "railways"})
+
+        self.assertEqual("railways", pid)
+        self.assertEqual("RAILWAY_PROJECT_ID", source)
+
+    def test_neither_set_leaves_no_default(self):
+        """No default is a supported state: the tools then ask for a project
+        rather than guessing one."""
+        pid, _ = server._pinned_default_project({})
+
+        self.assertEqual("", pid)
 
 
 class MetricsSizeTest(_StubbedServer):

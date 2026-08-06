@@ -140,6 +140,20 @@ schema: `builder="DOCKERFILE"` is refused locally, with a message naming
 `Builder` enum and the API's own answer is a GraphQL parse error naming neither
 the tool nor the argument.
 
+And one class for where the default project comes from
+(`DefaultProjectSourceTest`), because the obvious name for it is one Railway
+reserves. The platform injects `RAILWAY_PROJECT_ID` into every container with
+the id of the project the service is HOSTED in and rewrites it on each build,
+so it can never hold an operator's choice — it was set on the live riskwave
+service to the wanted project and shadowed again after both a restart and a
+full rebuild. Every riskwave call that omitted `project_id` therefore fell back
+to a project on the other account and answered "Not Authorized". The default is
+now read from `MCP_DEFAULT_PROJECT_ID` first, and the tests hold both halves of
+that: ours wins where it is set, and the reserved one still supplies the default
+where it is not, since the skyttedk service pins nothing and honouring only the
+new name would silently take its default away. An empty value counts as absent,
+because Railway hands an unset variable through as `""`.
+
 ## After an intended change to a tool's arguments
 
 The contract test fails on purpose. Confirm the change is wanted, then:
