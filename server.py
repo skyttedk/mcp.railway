@@ -490,10 +490,20 @@ async def set_region(environment_id: str, service_id: str, region: str,
     The change only takes effect on the next deploy — pass redeploy=true to
     trigger one immediately. NB: attached volumes do NOT move with the
     service; a volume stays in its own region, so check list_volumes before
-    moving a service with persistent storage."""
-    await _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
+    moving a service with persistent storage.
+
+    Refuses, and writes nothing, when the service has no instance in that
+    environment — Railway accepts the write silently in that case, so the
+    instance is confirmed first."""
+    refusal = await _instance_missing(environment_id, service_id, "set_region")
+    if refusal:
+        return refusal
+    data = await _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
       serviceInstanceUpdate(serviceId: $sid, environmentId: $eid, input: $input)
     }""", {"sid": service_id, "eid": environment_id, "input": {"region": region}})
+    rejected = _update_rejected(data, environment_id, service_id)
+    if rejected:
+        return rejected
     result: dict = {"serviceId": service_id, "environmentId": environment_id,
                     "region": region, "updated": True, "redeployed": False}
     if redeploy:
