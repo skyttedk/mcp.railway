@@ -50,6 +50,33 @@ def _pid(project_id: str = "") -> str:
     """Return project_id or the pinned default (MCP_DEFAULT_PROJECT_ID)."""
     return project_id or DEFAULT_PROJECT
 
+
+def _no_project(what: str, extra: str = "") -> str:
+    """The refusal for "no project_id given and none pinned", said once.
+
+    The tools that fall back to a default project used to answer this with a
+    bare line naming the environment variable and stopping there — true, and
+    useless to an agent that has no way to set a service variable and is
+    holding a project id it could simply have passed. It is also the one
+    failure here that is OURS, not Railway's, so it never passed through
+    _query_sync and never got explained: the same request that reads clearly
+    when the id is wrong read as a shrug when the id was missing.
+
+    So: name the two ways forward and where to get the id. Written once because
+    it is said in four places, and four copies drift.
+    """
+    message = (f"{what} needs a project, and none was given: project_id was "
+               "empty and no default project is pinned on this server "
+               "(MCP_DEFAULT_PROJECT_ID). Nothing was looked up. Pass "
+               "project_id explicitly — list_projects returns the ids this "
+               "token can see — or pin one by setting MCP_DEFAULT_PROJECT_ID "
+               "on the Railway service so it can be omitted in future.")
+    if extra:
+        message = f"{message} {extra}"
+    return json.dumps({"error": message,
+                       "projectId": "",
+                       "defaultProjectPinned": False})
+
 _thread_state = threading.local()
 
 def _session() -> requests.Session:
@@ -73,15 +100,48 @@ def _session() -> requests.Session:
         _thread_state.session = s
     return s
 
+class RailwayCallError(RuntimeError):
+    """A failed Railway call whose message is already the explanation.
+
+    Every tool here funnels through _query_sync, so this is the one place a
+    Railway failure can be explained once on behalf of all 32 of them. Anything
+    raised from that function is this type and its str() is the finished
+    sentence — a caller may re-raise it, embed it or show it to a user without
+    knowing which of the four failure modes it came from.
+
+    It subclasses RuntimeError deliberately: several tools already catch
+    RuntimeError to fold a Railway refusal into their own answer, and they must
+    keep catching this without being edited one by one.
+    """
+
+
 def _query_sync(query: str, variables: dict | None = None) -> dict:
-    # Auth stays a per-request header rather than a session default, so the
-    # session change alters only the connection, never what is sent.
-    r = _session().post(API, json={"query": query, "variables": variables or {}},
-                        headers={"Authorization": f"Bearer {TOKEN}"}, timeout=30)
-    r.raise_for_status()
-    data = r.json()
+    # Every exit from here is a RailwayCallError carrying _why()'s explanation.
+    #
+    # Until 2026-08-07 only the GraphQL-errors branch was dressed up, and only
+    # with _annotate_refusal; an HTTP 401, a connect timeout or an HTML error
+    # page from Railway's edge escaped as requests' own repr. list_projects was
+    # the single tool that translated those, because it is the only one that
+    # catches its failures — so it said "Railway refused the token (HTTP 401)"
+    # while the other 31 tools answered the same outage with a raw traceback
+    # string. An agent that had learnt the good wording from list_projects read
+    # a bare one from any other tool as a different, harder problem. Explaining
+    # at the boundary rather than per tool is what makes the next improvement
+    # to _why reach all of them at once.
+    try:
+        # Auth stays a per-request header rather than a session default, so the
+        # session change alters only the connection, never what is sent.
+        r = _session().post(API, json={"query": query, "variables": variables or {}},
+                            headers={"Authorization": f"Bearer {TOKEN}"}, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as exc:
+        # Includes the non-JSON body: Railway's edge answers an overload or a
+        # blocked request with HTML, and r.json() then raises a ValueError whose
+        # text is a character offset — the least informative failure of the lot.
+        raise RailwayCallError(_why(exc)) from exc
     if "errors" in data:
-        raise RuntimeError(_annotate_refusal(data["errors"][0]["message"]))
+        raise RailwayCallError(_rejected(_annotate_refusal(data["errors"][0]["message"])))
     return data["data"]
 
 # Railway answers a wrong id, an id belonging to someone else and a genuinely
@@ -123,6 +183,21 @@ def _annotate_refusal(message: str) -> str:
         return message + _REFUSAL_HINT
     return message
 
+def _rejected(message: str) -> str:
+    """The one line for "the call reached Railway and Railway said no".
+
+    Split out of _why so _query_sync can produce exactly the same sentence when
+    it raises, rather than a second wording that only looks similar. The token
+    is redacted and the text truncated here, in the one place Railway's own
+    words are turned into ours: this string now leaves the server both as a
+    raised error and inside a JSON answer, and a credential must not ride along
+    either exit.
+    """
+    if TOKEN:
+        message = message.replace(TOKEN, "***")
+    return f"Railway rejected the query: {message[:200]}"
+
+
 def _why(exc: Exception) -> str:
     """One short, credential-free line explaining why a Railway query failed.
 
@@ -136,18 +211,32 @@ def _why(exc: Exception) -> str:
     GraphQL message is Railway's text, so redact and truncate it anyway rather
     than trusting that.
     """
+    # A RailwayCallError has already been through here: _query_sync built its
+    # message with this function. Re-explaining it would produce "Railway
+    # rejected the query: Railway refused the token (HTTP 401)" — our own
+    # sentence quoted as if it were Railway's. Returning it unchanged is also
+    # what keeps list_projects' output identical to before the boundary was
+    # wrapped, since every failure it catches now arrives pre-explained.
+    if isinstance(exc, RailwayCallError):
+        return str(exc)
     response = getattr(exc, "response", None)
     if response is not None:
         code = response.status_code
         if code in (401, 403):
             return f"Railway refused the token (HTTP {code})"
         return f"Railway returned HTTP {code}"
+    # Checked before RequestException on purpose: requests' JSONDecodeError
+    # subclasses both, and the RequestException branch would call an HTML error
+    # page "unreachable" — sending the reader to look at the network when the
+    # request arrived and came back with a proxy page. It is also the least
+    # informative failure raw, since json's own text is a character offset.
+    if isinstance(exc, ValueError):
+        return ("Railway answered with a body that is not JSON — usually its "
+                "edge rather than the API (an error or rate-limit page), so "
+                "the request never reached GraphQL")
     if isinstance(exc, requests.exceptions.RequestException):
         return f"Railway was unreachable ({type(exc).__name__})"
-    msg = str(exc)
-    if TOKEN:
-        msg = msg.replace(TOKEN, "***")
-    return f"Railway rejected the query: {msg[:200]}"
+    return _rejected(str(exc))
 
 def _could_not_list(failures: list[str]) -> str:
     """The one sentence saying the project lookup failed, and why.
@@ -357,8 +446,7 @@ async def list_services(project_id: str = "") -> str:
     deploymentIsRunning."""
     pid = _pid(project_id)
     if not pid:
-        return json.dumps({"error": "No project_id provided and no default project pinned "
-                                    "(set MCP_DEFAULT_PROJECT_ID on the service)"})
+        return _no_project("list_services")
     data = await _query("""query($id: String!) {
       project(id: $id) { services { edges { node {
         id
@@ -701,6 +789,16 @@ async def create_service(project_id: str, environment_id: str, name: str,
         return json.dumps({"error": "branch applies to a repo source only. Pass "
                                     "repo as well, or drop branch. Nothing was "
                                     "created."})
+    # project_id is a required argument, so it cannot be absent — but it can be
+    # empty, which is what an agent sends when it expected the same pinned
+    # default the listings accept. Railway then answers the mutation with a
+    # refusal about the input, and the reader hunts through the source and the
+    # name before noticing the empty id. Refuse first, in the shared wording,
+    # rather than paying a round trip to be told something less clear.
+    if not project_id:
+        return _no_project("create_service", extra="Nothing was created. "
+                           "create_service takes no pinned default: the "
+                           "project has to be named in the call.")
     payload: dict = {
         "projectId": project_id,
         "environmentId": environment_id,
@@ -1680,11 +1778,12 @@ async def delete_service(service_id: str = "", name: str = "",
     if name:
         pid = _pid(project_id)
         if not pid:
-            return json.dumps({
-                "error": f"Cannot look up the service named {name!r}: no project_id "
-                         "given and no default project is pinned "
-                         "(MCP_DEFAULT_PROJECT_ID). Pass project_id, or pass "
-                         "service_id and skip the name lookup entirely."})
+            # Same shared sentence as the listings, plus the way out that is
+            # specific to this tool: an id needs no project lookup at all.
+            return _no_project(f"Looking up the service named {name!r} for "
+                               "delete_service", extra="Nothing was deleted. "
+                               "Passing service_id instead skips the name "
+                               "lookup, and the project, entirely.")
         data = await _query("""query($id: String!) {
           project(id: $id) { services { edges { node { id name } } } }
         }""", {"id": pid})
@@ -1924,8 +2023,7 @@ async def list_volumes(project_id: str = "") -> str:
     volume's `id` for delete_volume/update_volume_mount."""
     pid = _pid(project_id)
     if not pid:
-        return json.dumps({"error": "No project_id provided and no default project pinned "
-                                    "(set MCP_DEFAULT_PROJECT_ID on the service)"})
+        return _no_project("list_volumes")
     data = await _query("""query($id: String!) {
       project(id: $id) { volumes { edges { node {
         id
