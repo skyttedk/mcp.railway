@@ -1913,7 +1913,8 @@ class MissingServiceInstanceTest(_StubbedServer):
         session = self.install(routes)
         args = {"environment_id": "env-prod", "service_id": "svc-pdf"}
         args.update({"set_start_command": {"start_command": "node serve.js"},
-                     "set_service_config": {"num_replicas": 2}}[tool])
+                     "set_service_config": {"num_replicas": 2},
+                     "set_region": {"region": "europe-west4-drams3a"}}[tool])
         return json.loads(await _text(server.mcp.call_tool(tool, args))), session
 
     async def test_set_service_config_refuses_a_service_with_no_instance(self):
@@ -1937,10 +1938,24 @@ class MissingServiceInstanceTest(_StubbedServer):
         self.assertIn("env-prod", result["error"])
         self.assertEqual([], self._writes(session))
 
+    async def test_set_region_refuses_a_service_with_no_instance(self):
+        """set_region writes through the same serviceInstanceUpdate mutation and
+        had the same defect: a region change reported as applied while nothing
+        was written, surfacing later as configuration that had simply vanished.
+        """
+        result, session = await self._call("set_region", self._ABSENT)
+
+        self.assertNotIn("updated", result)
+        self.assertNotIn("redeployed", result,
+                         "a redeploy must not follow a write that never landed")
+        self.assertIn("svc-pdf", result["error"])
+        self.assertIn("env-prod", result["error"])
+        self.assertEqual([], self._writes(session))
+
     async def test_railways_own_not_found_is_a_refusal_too(self):
         """Railway answers this state with a GraphQL error rather than a null,
         depending on how the pair is wrong. Both mean the same thing here."""
-        for tool in ("set_service_config", "set_start_command"):
+        for tool in ("set_service_config", "set_start_command", "set_region"):
             with self.subTest(tool=tool):
                 result, session = await self._call(tool, self._NOT_FOUND)
 
@@ -1954,7 +1969,7 @@ class MissingServiceInstanceTest(_StubbedServer):
         present = {**self._WRITE, "serviceInstance(serviceId": {
             "serviceInstance": {"serviceId": "svc-pdf", "serviceName": "pdf"}}}
 
-        for tool in ("set_service_config", "set_start_command"):
+        for tool in ("set_service_config", "set_start_command", "set_region"):
             with self.subTest(tool=tool):
                 result, session = await self._call(tool, present)
 
@@ -1970,10 +1985,12 @@ class MissingServiceInstanceTest(_StubbedServer):
                         "serviceInstance": {"serviceId": "svc-pdf",
                                             "serviceName": "pdf"}}}
 
-        result, _ = await self._call("set_service_config", rejected)
+        for tool in ("set_service_config", "set_region"):
+            with self.subTest(tool=tool):
+                result, _ = await self._call(tool, rejected)
 
-        self.assertNotIn("updated", result)
-        self.assertIn("svc-pdf", result["error"])
+                self.assertNotIn("updated", result)
+                self.assertIn("svc-pdf", result["error"])
 
 
 class ContainerLivenessTest(_StubbedServer):
