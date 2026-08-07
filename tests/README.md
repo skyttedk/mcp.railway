@@ -175,6 +175,38 @@ nothing, so `deploy` must fall back to the mutation `start_service` uses when
 the container is gone — and must keep the old, cheap in-place restart, answer
 included, when it is not.
 
+## `ExplainedFailureTest` — every tool explains a failure, not just one
+
+`list_projects` is the only tool that catches its own failures, so for a long
+while it was also the only one that turned them into a sentence. A refused
+token read as `Railway refused the token (HTTP 401)` there and as requests' raw
+repr from the other 31 tools, and an agent that had learnt the first wording
+took the second for a different, harder problem. The explanation now happens
+once, in `_query_sync`, so the tests are about that boundary rather than about
+any tool: one tool from each family the card named — services, deployments,
+variables, domains, volumes, logs, metrics — must explain a 401 and an
+unreachable Railway, a 502 must name its status without being dressed as
+either, and a non-JSON body must be called an error page rather than reported
+as a network failure (requests' `JSONDecodeError` subclasses
+`RequestException`, so the wrong branch order quietly gets this wrong). Two
+more guard the seams: the explanation must not be applied twice when
+`list_projects` runs `_why` over a failure that now arrives pre-explained, and
+a tool that folds a Railway refusal into its own answer must keep folding —
+`RailwayCallError` subclasses `RuntimeError` for exactly that reason, and a
+plain `Exception` would turn every one of those handlers back into an uncaught
+error.
+
+## `MissingDefaultProjectTest` — the failure Railway never sees
+
+Four places need a project and may not have one, and that refusal is ours, so
+it never passed the explanation step at all. It used to name an environment
+variable and stop — true, and useless to an agent that cannot set a service
+variable and is holding a project id it could simply have passed. The tests
+hold all four to naming both ways forward, to saying nothing happened where a
+write was refused, to leaving room for the advice specific to one tool
+(`delete_service` needs no project at all when given an id), and to costing no
+round trip.
+
 ## After an intended change to a tool's arguments
 
 The contract test fails on purpose. Confirm the change is wanted, then:

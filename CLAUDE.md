@@ -20,8 +20,8 @@ Everything else is helpers around the tools: `_session()` (one `requests.Session
 per thread, because `anyio` reuses its worker threads and `Session` is not
 thread-safe), `_query()`/`_query_sync()` (every blocking call offloaded to a
 worker thread so a slow Railway response cannot block the event loop),
-`_annotate_refusal()`/`_why()` (Railway's error wording is misleading often
-enough that refusals are explained rather than echoed).
+`_annotate_refusal()`/`_rejected()`/`_why()` (Railway's error wording is
+misleading often enough that refusals are explained rather than echoed).
 
 ## The two services it deploys to
 
@@ -71,8 +71,8 @@ py -3.12 -m venv .venv
 The suite is stdlib `unittest`, so there is no test framework to install, but it
 imports `server.py` and therefore needs `requirements.txt` installed. It needs no
 Railway credentials and never contacts the Railway API: it swaps `server._session`
-for a fake at the HTTP boundary and refuses any call that forgets to. **83 tests,
-0.57 s, verified 2026-08-06** on Python 3.12.10. `tests/README.md` explains what
+for a fake at the HTTP boundary and refuses any call that forgets to. **113 tests,
+0.72 s, verified 2026-08-07** on Python 3.12.10. `tests/README.md` explains what
 each class is protecting and why.
 
 GitHub Actions runs the same command on every push and pull request
@@ -134,6 +134,34 @@ cheapest liveness check.
   the riskwave service needs `MCP_DEFAULT_PROJECT_ID` set to the `riskwave-app`
   project id (`7b8d2d41-8854-4742-bfff-dbfd946c2202`, chosen by the owner
   2026-08-06); until it is, pass `project_id` explicitly to that namespace.
+- **A tool's failure is explained at the boundary, not in the tool.** Everything
+  raised out of `_query_sync` is a `RailwayCallError` whose `str()` is already
+  the finished sentence `_why` produces — so all 32 tools report a refused
+  token, an unreachable Railway, a 5xx, a non-JSON edge page and a GraphQL
+  refusal in the same words, and the next improvement to `_why` reaches all of
+  them at once. Until 2026-08-07 only the GraphQL branch was dressed up and only
+  `list_projects` translated the rest, because it is the one tool that catches
+  its own failures; the same outage therefore read as
+  `Railway refused the token (HTTP 401)` from `list_projects` and as requests'
+  raw repr from the other 31, and an agent that had learnt the first wording
+  took the second for a harder problem. Two things to keep: `RailwayCallError`
+  subclasses `RuntimeError`, because several tools already catch that to fold a
+  refusal into their own answer and must keep catching without being edited one
+  by one; and `_why` returns a `RailwayCallError` unchanged, or it would quote
+  our own sentence back as if Railway had said it. The `ValueError` branch sits
+  **before** the `RequestException` one deliberately — requests'
+  `JSONDecodeError` subclasses both, and the wrong order files an HTML error
+  page under "unreachable". `ExplainedFailureTest` pins one tool per family.
+- **The missing-default-project refusal is ours, so nothing explains it for
+  us.** `list_services`, `list_volumes`, `delete_service` (name path) and
+  `create_service` refuse before any round trip when there is no project id and
+  none pinned — a failure that never passes `_query_sync` and so never met the
+  explanation step. All four now go through `_no_project()`, which names both
+  ways forward (pass `project_id`, whose ids `list_projects` returns, or pin
+  `MCP_DEFAULT_PROJECT_ID`) and takes an `extra` for the tool-specific way out.
+  The old wording named only the environment variable, which an agent cannot
+  set and did not need. `MissingDefaultProjectTest` pins it, including that the
+  refusal costs no request.
 - **Railway's `Not Authorized` usually is not a permissions problem.** It is what
   the API answers when an id is not recognised *on the account the token belongs
   to* — most often a project or service id from the other account. `_annotate_refusal`

@@ -2197,6 +2197,219 @@ class ContainerLivenessTest(_StubbedServer):
                       "evidence")
 
 
+class ExplainedFailureTest(_StubbedServer):
+    """Every tool explains a failed Railway call, not just list_projects.
+
+    `_annotate_refusal` already covered the GraphQL-errors branch for all tools
+    (RefusalWordingTest pins that). The gap this class exists for is everything
+    that never reaches GraphQL — an HTTP 401 or 502, a connect timeout, an HTML
+    page from Railway's edge. Those escaped `_query_sync` as requests' own repr,
+    and only list_projects turned them into a sentence, because it is the only
+    tool that catches its own failures. So the same outage read as
+    "Railway refused the token (HTTP 401)" from one tool and as a raw exception
+    string from the other 31 — and an agent that had learnt the first wording
+    took the second for a different, harder problem.
+
+    The fix is one wrapper at the boundary, so the properties worth locking are
+    about the boundary: the explanation reaches tools that have no error
+    handling of their own, it reaches every failure mode, it does not get
+    applied twice, and it still cannot carry the token.
+    """
+
+    @staticmethod
+    def _http(status: int) -> requests.exceptions.HTTPError:
+        response = requests.Response()
+        response.status_code = status
+        return requests.exceptions.HTTPError(f"{status} Server Error", response=response)
+
+    async def _failure_text(self, tool: str, args: dict, exc: Exception) -> str:
+        """Run `tool` with every Railway call failing as `exc`, return the text
+        the caller sees — raised or returned, since tools do both."""
+        self.install({"": exc})
+        try:
+            return await _text(server.mcp.call_tool(tool, args))
+        except Exception as raised:  # noqa: BLE001 — the answer under test
+            return str(raised)
+
+    # The tools the card names, one per family, each with the arguments it
+    # needs. A family is represented rather than exhaustively listed: they all
+    # reach Railway through the same _query, so one from each proves the
+    # wrapper is not tool-specific — and these are the ones with no error
+    # handling of their own, which is precisely why they used to fail bare.
+    COVERED = {
+        "list_services": {"project_id": "p1"},
+        "create_service": {"project_id": "p1", "environment_id": "e1", "name": "s"},
+        "create_deployment": {"environment_id": "e1", "service_id": "svc1"},
+        "list_variables": {"project_id": "p1", "environment_id": "e1"},
+        "set_variables": {"project_id": "p1", "environment_id": "e1",
+                          "service_id": "svc1", "variables": {"A": "b"}},
+        "list_service_domains": {"project_id": "p1", "environment_id": "e1",
+                                 "service_id": "svc1"},
+        "create_service_domain": {"project_id": "p1", "environment_id": "e1",
+                                  "service_id": "svc1"},
+        "list_volumes": {"project_id": "p1"},
+        "create_volume": {"project_id": "p1", "environment_id": "e1",
+                          "service_id": "svc1", "mount_path": "/data"},
+        "delete_volume": {"volume_id": "v1"},
+        "get_logs": {"project_id": "p1", "environment_id": "e1", "service_id": "svc1"},
+        "get_metrics": {"project_id": "p1", "environment_id": "e1",
+                        "service_id": "svc1", "start_date": "2026-08-01T00:00:00Z"},
+        "list_environments": {"project_id": "p1"},
+        "get_service_instance": {"environment_id": "e1", "service_id": "svc1"},
+    }
+
+    async def test_every_covered_tool_explains_a_refused_token(self):
+        """The defect in one assertion, across the whole fleet of tools: an
+        HTTP 401 used to arrive as requests' "401 Server Error" string from
+        every one of these. Now each says which of the three situations it is.
+        """
+        for tool, args in self.COVERED.items():
+            with self.subTest(tool=tool):
+                message = await self._failure_text(tool, args, self._http(401))
+                self.assertIn("Railway refused the token (HTTP 401)", message,
+                              f"{tool} still reports a bare platform error")
+
+    async def test_every_covered_tool_explains_an_unreachable_railway(self):
+        """The second failure mode. It must read differently from a refusal —
+        the two need opposite responses, and telling them apart was the whole
+        point of the wording list_projects already had."""
+        for tool, args in self.COVERED.items():
+            with self.subTest(tool=tool):
+                message = await self._failure_text(
+                    tool, args, requests.exceptions.ConnectionError("no route"))
+                self.assertIn("Railway was unreachable", message,
+                              f"{tool} still reports a bare platform error")
+                self.assertNotIn("refused the token", message)
+
+    async def test_a_server_error_names_the_status(self):
+        """A 502 is neither a refusal nor an outage of ours to fix, so it must
+        not be dressed as either — it says the status and stops."""
+        message = await self._failure_text("list_volumes", {"project_id": "p1"},
+                                           self._http(502))
+
+        self.assertIn("Railway returned HTTP 502", message)
+        self.assertNotIn("refused the token", message)
+
+    async def test_a_non_json_body_is_named_rather_than_shown_as_an_offset(self):
+        """Railway's edge answers an overload or a blocked request with HTML.
+        json() then raises a character-offset error, the least informative
+        failure of the lot, and requests' JSONDecodeError subclasses
+        RequestException — so an ordering slip here would file an error page
+        under "unreachable" and send the reader to look at the network."""
+        message = await self._failure_text(
+            "get_metrics", self.COVERED["get_metrics"],
+            requests.exceptions.JSONDecodeError("Expecting value", "<html>", 0))
+
+        self.assertIn("not JSON", message)
+        self.assertNotIn("unreachable", message,
+                         "an error page was reported as a network failure")
+
+    async def test_the_explanation_is_not_applied_twice(self):
+        """_why is still called by list_projects on failures that now arrive
+        pre-explained. Without the RailwayCallError shortcut it would wrap its
+        own sentence — "Railway rejected the query: Railway refused the token
+        (HTTP 401)" — quoting us as if it were Railway."""
+        self.install({"": self._http(401)})
+
+        result = json.loads(await _text(server.mcp.call_tool("list_projects", {})))
+
+        reason = result["error"] if "error" in result else result[0]["warning"]
+        self.assertIn("Railway refused the token (HTTP 401)", reason)
+        self.assertNotIn("rejected the query", reason,
+                         "the explanation was explained a second time")
+
+    async def test_an_explained_failure_cannot_carry_the_token(self):
+        """The wrapper turns Railway's words into ours for 32 tools at once, so
+        the redaction has to hold at the boundary rather than in the one tool
+        that used to do it."""
+        original = server.TOKEN
+        server.TOKEN = "super-secret-token"
+        self.addCleanup(setattr, server, "TOKEN", original)
+
+        message = await self._failure_text(
+            "list_environments", {"project_id": "p1"},
+            RuntimeError("refused for Bearer super-secret-token"))
+
+        self.assertNotIn("super-secret-token", message)
+        self.assertIn("***", message)
+
+    async def test_a_wrapping_tool_still_folds_the_failure_into_its_own_answer(self):
+        """The tools that DO catch RuntimeError must keep catching. The wrapper
+        raises a RailwayCallError, and it subclasses RuntimeError precisely so
+        those handlers are not edited one at a time — a plain Exception here
+        would turn every one of them back into an uncaught error."""
+        self.install({"service(id:": self._http(401)})
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "delete_service", {"service_id": "svc1"})))
+
+        self.assertIn("Nothing was deleted", result["error"],
+                      "the tool's own refusal was replaced by a raised error")
+        self.assertIn("Railway refused the token (HTTP 401)", result["error"])
+
+
+class MissingDefaultProjectTest(_StubbedServer):
+    """The one failure here that is ours, not Railway's — and so the one that
+    never passed the explanation step at all.
+
+    Four places need a project and may not have one. They used to answer with a
+    bare line naming an environment variable: true, and useless to an agent
+    that cannot set a service variable and is holding a project id it could
+    simply have passed. Said once now, naming both ways forward.
+    """
+
+    def setUp(self):
+        original = server.DEFAULT_PROJECT
+        server.DEFAULT_PROJECT = ""
+        self.addCleanup(setattr, server, "DEFAULT_PROJECT", original)
+
+    CASES = {
+        "list_services": {},
+        "list_volumes": {},
+        "delete_service": {"name": "some-service"},
+        "create_service": {"project_id": "", "environment_id": "e1", "name": "s"},
+    }
+
+    async def test_each_one_explains_what_to_do_instead(self):
+        for tool, args in self.CASES.items():
+            with self.subTest(tool=tool):
+                # No routes: reaching Railway at all would already be the bug.
+                self.install({})
+                session = server._session()
+
+                result = json.loads(await _text(server.mcp.call_tool(tool, args)))
+
+                self.assertIn("MCP_DEFAULT_PROJECT_ID", result["error"])
+                self.assertIn("list_projects", result["error"],
+                              "the reader is told to pin a variable but not "
+                              "where to get a project id")
+                self.assertIn("project_id", result["error"])
+                self.assertEqual([], session.calls,
+                                 "the refusal cost a round trip it did not need")
+
+    async def test_the_write_says_nothing_happened(self):
+        """A listing that refuses has changed nothing by definition; a create
+        has to say so, because the reader's next question is whether a
+        half-made service is now sitting in the project."""
+        self.install({})
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "create_service", {"project_id": "", "environment_id": "e1", "name": "s"})))
+
+        self.assertIn("Nothing was created", result["error"])
+
+    async def test_delete_service_still_offers_its_own_way_out(self):
+        """The shared sentence must not crowd out the advice that is specific
+        to one tool: delete_service needs no project at all when given an id."""
+        self.install({})
+
+        result = json.loads(await _text(server.mcp.call_tool(
+            "delete_service", {"name": "some-service"})))
+
+        self.assertIn("service_id", result["error"])
+        self.assertIn("Nothing was deleted", result["error"])
+
+
 async def _text(call) -> str:
     """Pull the tool's string return value out of whatever call_tool answers.
 
