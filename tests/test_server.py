@@ -1961,6 +1961,100 @@ class RegionOverrideTest(_StubbedServer):
                          if "serviceInstanceRedeploy" in c["query"]])
 
 
+class BuildCommandTest(_StubbedServer):
+    """The build command has to be writable, not only readable.
+
+    get_service_instance reported `buildCommand` and set_start_command changed
+    the other half of the deploy, but the build command had no setter of its
+    own — a production service left carrying a build command from an earlier
+    architecture could be seen and not corrected, so the fix went to a human
+    with dashboard access. set_build_command mirrors set_start_command exactly:
+    `""` clears the override as an explicit null (an omitted key means
+    "untouched" to ServiceInstanceUpdateInput, not "reset"), the redeploy is
+    opt-in, and a missing service instance is refused rather than reported as
+    written.
+    """
+
+    _ROUTE = {"serviceInstanceUpdate": {"serviceInstanceUpdate": True},
+              "serviceInstance(serviceId": {
+                  "serviceInstance": {"serviceId": "svc1", "serviceName": "web"}}}
+
+    @staticmethod
+    def _sent(session: _FakeSession) -> dict:
+        writes = [c for c in session.calls if "serviceInstanceUpdate" in c["query"]]
+        assert len(writes) == 1, f"expected one write, got {len(writes)}"
+        return writes[0]["variables"]["input"]
+
+    async def _set(self, session_routes: dict, build_command: str,
+                   **extra) -> tuple[dict, _FakeSession]:
+        session = self.install(session_routes)
+        args = {"environment_id": "e1", "service_id": "svc1",
+                "build_command": build_command}
+        args.update(extra)
+        return json.loads(await _text(
+            server.mcp.call_tool("set_build_command", args))), session
+
+    async def test_a_build_command_is_written(self):
+        result, session = await self._set(self._ROUTE, "npm run build")
+
+        self.assertEqual({"buildCommand": "npm run build"}, self._sent(session),
+                         "the write must touch buildCommand and nothing else")
+        self.assertEqual("npm run build", result["buildCommand"])
+        self.assertTrue(result["updated"])
+        self.assertFalse(result["redeployed"])
+        self.assertIn("next deploy", result["note"])
+
+    async def test_an_empty_build_command_clears_the_override(self):
+        """The key must be present and null, exactly as set_start_command and
+        set_region send their clear — dropping it leaves Railway's stored
+        override in place, which is the state this card was filed about."""
+        result, session = await self._set(self._ROUTE, "")
+
+        sent = self._sent(session)
+        self.assertIn("buildCommand", sent,
+                      "the key was dropped, so the override was left in place")
+        self.assertIsNone(sent["buildCommand"])
+        self.assertIsNone(result["buildCommand"])
+        self.assertTrue(result["updated"])
+
+    async def test_redeploy_is_opt_in(self):
+        routes = {**self._ROUTE,
+                  "serviceInstanceRedeploy": {"serviceInstanceRedeploy": True}}
+
+        quiet, session = await self._set(self._ROUTE, "npm run build")
+        self.assertFalse(quiet["redeployed"])
+        self.assertEqual([], [c for c in session.calls
+                              if "serviceInstanceRedeploy" in c["query"]])
+
+        loud, session = await self._set(routes, "npm run build", redeploy=True)
+        self.assertTrue(loud["redeployed"])
+        self.assertTrue([c for c in session.calls
+                         if "serviceInstanceRedeploy" in c["query"]])
+
+    async def test_it_refuses_a_service_with_no_instance(self):
+        """Same serviceInstanceUpdate, same silent acceptance for an absent
+        instance, so the same guard — including on the clear."""
+        absent = {**self._ROUTE, "serviceInstance(serviceId": {"serviceInstance": None}}
+
+        for value in ("npm run build", ""):
+            with self.subTest(build_command=value):
+                result, session = await self._set(absent, value)
+
+                self.assertNotIn("updated", result)
+                self.assertIn("svc1", result["error"])
+                self.assertIn("e1", result["error"])
+                self.assertEqual([], [c for c in session.calls
+                                      if "serviceInstanceUpdate" in c["query"]])
+
+    async def test_a_rejected_mutation_is_not_reported_as_updated(self):
+        rejected = {**self._ROUTE,
+                    "serviceInstanceUpdate": {"serviceInstanceUpdate": False}}
+        result, _ = await self._set(rejected, "npm run build")
+
+        self.assertNotIn("updated", result)
+        self.assertIn("svc1", result["error"])
+
+
 class MissingServiceInstanceTest(_StubbedServer):
     """Regression: config writes reported success for an instance that was not
     there.
@@ -1989,6 +2083,7 @@ class MissingServiceInstanceTest(_StubbedServer):
         session = self.install(routes)
         args = {"environment_id": "env-prod", "service_id": "svc-pdf"}
         args.update({"set_start_command": {"start_command": "node serve.js"},
+                     "set_build_command": {"build_command": "npm run build"},
                      "set_service_config": {"num_replicas": 2},
                      "set_region": {"region": "europe-west4-drams3a"}}[tool])
         return json.loads(await _text(server.mcp.call_tool(tool, args))), session
@@ -2014,6 +2109,16 @@ class MissingServiceInstanceTest(_StubbedServer):
         self.assertIn("env-prod", result["error"])
         self.assertEqual([], self._writes(session))
 
+    async def test_set_build_command_refuses_a_service_with_no_instance(self):
+        """The newest tool on this mutation, added with the guard rather than
+        after it — set_region shipped the defect for a day by being left out."""
+        result, session = await self._call("set_build_command", self._ABSENT)
+
+        self.assertNotIn("updated", result)
+        self.assertIn("svc-pdf", result["error"])
+        self.assertIn("env-prod", result["error"])
+        self.assertEqual([], self._writes(session))
+
     async def test_set_region_refuses_a_service_with_no_instance(self):
         """set_region writes through the same serviceInstanceUpdate mutation and
         had the same defect: a region change reported as applied while nothing
@@ -2031,7 +2136,8 @@ class MissingServiceInstanceTest(_StubbedServer):
     async def test_railways_own_not_found_is_a_refusal_too(self):
         """Railway answers this state with a GraphQL error rather than a null,
         depending on how the pair is wrong. Both mean the same thing here."""
-        for tool in ("set_service_config", "set_start_command", "set_region"):
+        for tool in ("set_service_config", "set_start_command", "set_region",
+                     "set_build_command"):
             with self.subTest(tool=tool):
                 result, session = await self._call(tool, self._NOT_FOUND)
 
@@ -2045,7 +2151,8 @@ class MissingServiceInstanceTest(_StubbedServer):
         present = {**self._WRITE, "serviceInstance(serviceId": {
             "serviceInstance": {"serviceId": "svc-pdf", "serviceName": "pdf"}}}
 
-        for tool in ("set_service_config", "set_start_command", "set_region"):
+        for tool in ("set_service_config", "set_start_command", "set_region",
+                     "set_build_command"):
             with self.subTest(tool=tool):
                 result, session = await self._call(tool, present)
 

@@ -243,6 +243,19 @@
       "project_id": "string"
     }
   },
+  "set_build_command": {
+    "required": [
+      "build_command",
+      "environment_id",
+      "service_id"
+    ],
+    "args": {
+      "build_command": "string",
+      "environment_id": "string",
+      "redeploy": "boolean",
+      "service_id": "string"
+    }
+  },
   "set_region": {
     "required": [
       "environment_id",
