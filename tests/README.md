@@ -120,6 +120,20 @@ of being an unchanged id that reads like a push that never landed; and they
 hold the description to saying it cannot confirm a deploy and naming
 `get_logs` and `create_deployment`, which can.
 
+And one class for the other way that listing misleads mid-deploy
+(`InFlightDeploymentTest`). Railway answered `deploymentStopped: true` for a
+deployment that was actively BUILDING and succeeded seconds later, so the same
+listing that cannot confirm a deploy could also actively deny one — an agent
+trusting the flag concludes the build is dead and nudges a redeploy on top of a
+healthy one. The flag means nothing until a deployment has a container to stop,
+so it is corrected to false on the statuses that cannot have one yet
+(`_IN_FLIGHT_STATUSES`), with Railway's raw value kept as
+`railwayDeploymentStopped` and a note saying why. The tests hold every in-flight
+status to that, and — the half that matters more — hold SUCCESS, SLEEPING,
+CRASHED and FAILED to keeping the flag, because it is the *only* evidence a
+stopped service leaves and a blanket false would restore exactly the blindness
+`StopStartTest` exists to prevent.
+
 And two classes for how a service gets its source and its build settings
 (`ServiceSourceTest`, `ServiceConfigTest`), because both were places where the
 server could do less than Railway can and an agent's only visible option was to
