@@ -487,7 +487,9 @@ async def get_service_instance(environment_id: str, service_id: str) -> str:
     `region` is the per-service override; null means the service inherits
     Railway's default region (currently US West / us-west2 for new services —
     confirm with list_regions). Change it with set_region, and remove it again
-    with set_region and an empty region."""
+    with set_region and an empty region. `buildCommand` and `startCommand` have
+    their own setters too — set_build_command and set_start_command — each
+    clearing the override again on an empty string."""
     data = await _query("""query($sid: String!, $eid: String!) {
       serviceInstance(serviceId: $sid, environmentId: $eid) {
         serviceId
@@ -654,6 +656,48 @@ async def set_start_command(environment_id: str, service_id: str, start_command:
     return json.dumps(result)
 
 
+@mcp.tool()
+async def set_build_command(environment_id: str, service_id: str, build_command: str,
+                      redeploy: bool = False) -> str:
+    """Set or clear the custom build command for a service in one environment.
+
+    The counterpart to set_start_command for the other half of the deploy:
+    get_service_instance reports `buildCommand`, and this is how it is changed.
+    Pass an empty string to clear the override so the service falls back to
+    whatever its builder (Railpack/Nixpacks/Dockerfile) works out on its own.
+    The change only takes effect on the next deploy — pass redeploy=true to
+    trigger one immediately.
+
+    set_service_config also carries build_command, for changing it together
+    with other build settings in a single write; this tool is the standalone
+    one, and the two write the same field.
+
+    Refuses, and writes nothing, when the service has no instance in that
+    environment — Railway accepts the write silently in that case, so the
+    instance is confirmed first."""
+    refusal = await _instance_missing(environment_id, service_id, "set_build_command")
+    if refusal:
+        return refusal
+    data = await _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
+      serviceInstanceUpdate(serviceId: $sid, environmentId: $eid, input: $input)
+    }""", {"sid": service_id, "eid": environment_id,
+           "input": {"buildCommand": build_command or None}})
+    rejected = _update_rejected(data, environment_id, service_id)
+    if rejected:
+        return rejected
+    result: dict = {"serviceId": service_id, "environmentId": environment_id,
+                    "buildCommand": build_command or None, "updated": True,
+                    "redeployed": False}
+    if redeploy:
+        await _query("""mutation($sid: String!, $eid: String!) {
+          serviceInstanceRedeploy(serviceId: $sid, environmentId: $eid)
+        }""", {"sid": service_id, "eid": environment_id})
+        result["redeployed"] = True
+    else:
+        result["note"] = "Build-command change takes effect on the next deploy."
+    return json.dumps(result)
+
+
 # Railway's own enums. Sent as GraphQL enum values, so a typo is rejected by
 # the API with a parse error that names neither the tool nor the argument —
 # checking here turns that into a message the caller can act on.
@@ -680,7 +724,9 @@ async def set_service_config(environment_id: str, service_id: str,
                              redeploy: bool = False) -> str:
     """Set build and deploy settings for a service in one environment — the
     dashboard's Settings tab, minus what already has its own tool
-    (set_region, set_start_command, set_variables).
+    (set_region, set_start_command, set_variables). build_command is the one
+    overlap: set_build_command changes it on its own, this changes it together
+    with the other build settings in a single write.
 
     Every setting is optional and **omitting one leaves it untouched**; only
     the arguments actually passed are sent to Railway. For the string

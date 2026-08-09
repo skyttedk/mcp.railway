@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 An MCP server for Railway hosting, talking straight to Railway's GraphQL API
 (`https://backboard.railway.com/graphql/v2`) — no Railway CLI involved. It covers
 projects, services, environments, variables, deployments, logs, metrics, domains
-and volumes: 32 tools, all of them in one file, `server.py`.
+and volumes: 33 tools, all of them in one file, `server.py`.
 Repo: `skyttedk/mcp.railway`.
 
 It runs two ways from that same file. `MCP_TRANSPORT` unset (or anything other
@@ -71,8 +71,8 @@ py -3.12 -m venv .venv
 The suite is stdlib `unittest`, so there is no test framework to install, but it
 imports `server.py` and therefore needs `requirements.txt` installed. It needs no
 Railway credentials and never contacts the Railway API: it swaps `server._session`
-for a fake at the HTTP boundary and refuses any call that forgets to. **113 tests,
-0.72 s, verified 2026-08-07** on Python 3.12.10. `tests/README.md` explains what
+for a fake at the HTTP boundary and refuses any call that forgets to. **123 tests,
+0.92 s, verified 2026-08-09** on Python 3.12.10. `tests/README.md` explains what
 each class is protecting and why.
 
 GitHub Actions runs the same command on every push and pull request
@@ -84,7 +84,7 @@ on purpose. Confirm the change is wanted, then regenerate and commit the snapsho
 alongside it:
 
 ```powershell
-.\.venv\Scripts\python.exe tests\test_server.py --refresh   # "wrote 32 tools to …"
+.\.venv\Scripts\python.exe tests\test_server.py --refresh   # "wrote 33 tools to …"
 ```
 
 ## Deploy
@@ -136,7 +136,7 @@ cheapest liveness check.
   2026-08-06); until it is, pass `project_id` explicitly to that namespace.
 - **A tool's failure is explained at the boundary, not in the tool.** Everything
   raised out of `_query_sync` is a `RailwayCallError` whose `str()` is already
-  the finished sentence `_why` produces — so all 32 tools report a refused
+  the finished sentence `_why` produces — so all 33 tools report a refused
   token, an unreachable Railway, a 5xx, a non-JSON edge page and a GraphQL
   refusal in the same words, and the next improvement to `_why` reaches all of
   them at once. Until 2026-08-07 only the GraphQL branch was dressed up and only
@@ -240,6 +240,13 @@ cheapest liveness check.
   its presence or by `dockerfilePath`, never by choosing a builder.
   `ServiceConfigTest` refuses the `DOCKERFILE` guess with a message naming
   `dockerfile_path`, because that is the wrong turn an agent actually takes.
+  **`build_command` is deliberately written by two tools**: `set_service_config`
+  (together with other build settings, one write) and `set_build_command`
+  (on its own, the sibling of `set_start_command`, added 2026-08-09 because the
+  build command was readable in `get_service_instance` and had no setter an
+  agent could find). Both send the same `buildCommand` field — do not "de-
+  duplicate" it out of `set_service_config`, which would change that tool's
+  published arguments for both namespaces.
 - **In `set_service_config`, an omitted setting and a cleared one must stay
   different things.** It sends a partial `ServiceInstanceUpdateInput`, and every
   key present in that payload is written — so a truthiness filter over the
@@ -264,9 +271,10 @@ cheapest liveness check.
   found", sometimes a bare "Not Authorized" that hides whether the thing exists
   at all). The mutation's Boolean result, previously discarded, is now checked
   for an explicit `false` only, so a null or absent value behaves as before.
-  `MissingServiceInstanceTest` pins it for all three. Any future tool reaching
-  for `serviceInstanceUpdate` needs the same two lines — `set_region` was left
-  out of the first pass and shipped the defect for a day.
+  `MissingServiceInstanceTest` pins it for all four setters. Any future tool
+  reaching for `serviceInstanceUpdate` needs the same two lines — `set_region`
+  was left out of the first pass and shipped the defect for a day;
+  `set_build_command` (2026-08-09) was written with them from the start.
 - **`deploy` and `create_deployment` are not the same operation, and the
   confusion is silent.** `deploy` restarts the container already running and
   builds nothing, so an agent reaching for it sees a success and reports that new
