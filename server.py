@@ -403,6 +403,46 @@ async def create_project(name: str, description: str = "", workspace_id: str = "
     proj["environments"] = [e["node"] for e in proj["environments"]["edges"]]
     return json.dumps(proj)
 
+# Statuses of a deployment that has not finished being released yet: it is on
+# its way up and has never had a container. Railway nevertheless answers
+# `deploymentStopped: true` for such a deployment — seen 2026-08-06 on a build
+# that was actively BUILDING and succeeded seconds later (card
+# "list_services reports a fresh BUILDING deployment as deploymentStopped: true").
+# The flag is only meaningful once a deployment HAS a container to stop, so on
+# an in-flight one it is noise, and noise that reads as "this deploy is dead" —
+# exactly the wrong conclusion while a build is running, and the one that makes
+# an agent fire a pointless redeploy nudge.
+#
+# Kept separate from _LIVE_STATUSES / _RESTARTABLE_STATUSES / _STOPPABLE_STATUSES
+# for the same reason those three are separate from each other: they answer
+# different questions and Railway is free to move one without the others. Those
+# three all exclude in-flight statuses already, so `_running_deployment` and
+# `stop_service` never see the bogus flag — only the raw listing does.
+_IN_FLIGHT_STATUSES = ("BUILDING", "DEPLOYING", "INITIALIZING", "QUEUED",
+                       "WAITING", "NEEDS_APPROVAL")
+
+
+def _correct_stopped_flag(deployment: dict | None) -> dict | None:
+    """Clear `deploymentStopped` on a deployment that is still in flight.
+
+    Genuinely stopped, crashed and removed deployments are untouched — the flag
+    keeps its meaning; only a status that cannot have a container yet is
+    corrected. Railway's own value is preserved as `railwayDeploymentStopped`
+    beside a note, so nothing is hidden from a caller who wants to see it."""
+    if not deployment or not deployment.get("deploymentStopped"):
+        return deployment
+    if deployment.get("status") not in _IN_FLIGHT_STATUSES:
+        return deployment
+    deployment["deploymentStopped"] = False
+    deployment["railwayDeploymentStopped"] = True
+    deployment["deploymentStoppedNote"] = (
+        f"Railway reported deploymentStopped=true for this {deployment['status']} "
+        "deployment, which has no container yet and so cannot have been stopped; "
+        "it is reported as not stopped here. The build is still in flight — wait "
+        "for it, do not read this as a dead deploy and do not redeploy on it.")
+    return deployment
+
+
 @mcp.tool()
 async def list_services(project_id: str = "") -> str:
     """List services in a Railway project (uses the pinned default project,
@@ -421,6 +461,16 @@ async def list_services(project_id: str = "") -> str:
     looks identical to a live one here — and a service whose domain has been
     removed shows up nowhere else — which is exactly how a service ends up
     forgotten. latestDeployment null means the service has never deployed.
+
+    A DEPLOYMENT THAT IS STILL IN FLIGHT IS NEVER REPORTED AS STOPPED. Railway
+    has been seen answering deploymentStopped=true for a deployment that was
+    actively BUILDING and succeeded seconds later; the flag only means anything
+    once a deployment has a container to stop, so on a BUILDING / DEPLOYING /
+    INITIALIZING / QUEUED / WAITING / NEEDS_APPROVAL status it is corrected to
+    false here, with Railway's raw value kept as `railwayDeploymentStopped` and
+    a `deploymentStoppedNote` saying why. Uncorrected it reads as a dead deploy
+    mid-build. For genuinely stopped, crashed or failed deployments the flag is
+    passed through untouched.
 
     A SUCCESSFUL, UNSTOPPED DEPLOYMENT IS STILL NOT PROOF OF A RUNNING
     CONTAINER. These fields describe the deployment, not the process: a service
@@ -463,6 +513,8 @@ async def list_services(project_id: str = "") -> str:
     for e in data["project"]["services"]["edges"]:
         svc = e["node"]
         svc["instances"] = [i["node"] for i in svc.pop("serviceInstances")["edges"]]
+        for inst in svc["instances"]:
+            _correct_stopped_flag(inst.get("latestDeployment"))
         services.append(svc)
     return json.dumps(services)
 

@@ -71,8 +71,8 @@ py -3.12 -m venv .venv
 The suite is stdlib `unittest`, so there is no test framework to install, but it
 imports `server.py` and therefore needs `requirements.txt` installed. It needs no
 Railway credentials and never contacts the Railway API: it swaps `server._session`
-for a fake at the HTTP boundary and refuses any call that forgets to. **123 tests,
-0.92 s, verified 2026-08-09** on Python 3.12.10. `tests/README.md` explains what
+for a fake at the HTTP boundary and refuses any call that forgets to. **128 tests,
+0.82 s, verified 2026-08-09** on Python 3.12.10. `tests/README.md` explains what
 each class is protecting and why.
 
 GitHub Actions runs the same command on every push and pull request
@@ -223,6 +223,26 @@ cheapest liveness check.
   deploy with the id `create_deployment` returns, or with `get_logs`, which
   queries `deployments(DeploymentListInput)` directly. `DeploymentFreshnessTest`
   pins both halves.
+- **Railway's `deploymentStopped` is meaningless until a deployment has a
+  container, and it does not answer false there — it answers true.** Seen
+  2026-08-06 on the riskwave-site project: `list_services` reported
+  `deploymentStopped: true` for a deployment that was actively BUILDING and
+  went to SUCCESS seconds later. The flag describes a deployment that was
+  deliberately stopped, which a build on its way up cannot have been, so on the
+  statuses that have no container yet it is noise — and noise that reads as
+  "this deploy is dead" exactly while it is alive, which is the failure the
+  lagging-`latestDeployment` note above already warns about, arriving from the
+  other direction. `list_services` now clears it for
+  `_IN_FLIGHT_STATUSES` (`BUILDING, DEPLOYING, INITIALIZING, QUEUED, WAITING,
+  NEEDS_APPROVAL`), keeping Railway's own value as `railwayDeploymentStopped`
+  next to a `deploymentStoppedNote`. The correction stops there on purpose: for
+  SUCCESS/SLEEPING/CRASHED/FAILED the flag is passed through, because it is the
+  only evidence a stopped service leaves (there is no STOPPED status) and a
+  blanket false would bring back the invisible-stopped-service defect. The three
+  other status tuples (`_LIVE_STATUSES`, `_RESTARTABLE_STATUSES`,
+  `_STOPPABLE_STATUSES`) all exclude in-flight statuses already, so
+  `_running_deployment`, `deploy` and `stop_service` never saw the bogus flag —
+  only the raw listing did. `InFlightDeploymentTest` pins both halves.
 - **A service's source and its build settings are two different mutations, and
   neither is `serviceCreate` alone.** `create_service`/`connect_service` set the
   SOURCE (`ServiceSourceInput`: a GitHub `repo` or a Docker `image` — one or the

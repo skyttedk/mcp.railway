@@ -682,6 +682,101 @@ class DeploymentFreshnessTest(_StubbedServer):
         self.assertIn("create_deployment", listing)
 
 
+class InFlightDeploymentTest(_StubbedServer):
+    """A deployment that is still being built is not a stopped one.
+
+    Railway answered `deploymentStopped: true` for a deployment that was
+    actively BUILDING and succeeded seconds later (observed 2026-08-06 on the
+    riskwave-site project; the deployment detail view said SUCCESS/running).
+    The flag only means something once a deployment has a container to stop, so
+    on an in-flight status it is noise — and noise that reads as "this deploy is
+    dead" precisely while a build is running, which is what makes an agent give
+    up on a healthy deploy or fire a redeploy nudge on top of it.
+
+    The correction is deliberately narrow: only statuses that cannot have a
+    container yet are touched. A genuinely stopped, crashed or failed deployment
+    keeps the flag, or the field would stop meaning anything at all and the
+    stopped-service blindness StopStartTest exists for would come straight
+    back."""
+
+    @staticmethod
+    def _listing(status: str, stopped: bool) -> dict:
+        return {"project(id:": {"project": {"services": {"edges": [
+            {"node": {"id": "svc1", "name": "api", "serviceInstances": {"edges": [
+                {"node": {"environmentId": "e1", "region": None, "numReplicas": 1,
+                          "latestDeployment": {"id": "dep-new",
+                                               "createdAt": "2026-08-06T08:56:00Z",
+                                               "status": status,
+                                               "deploymentStopped": stopped}}},
+            ]}}},
+        ]}}}}
+
+    async def _latest(self, status: str, stopped: bool) -> dict:
+        self.install(self._listing(status, stopped))
+        result = json.loads(await _text(server.mcp.call_tool(
+            "list_services", {"project_id": "p1"})))
+        return result[0]["instances"][0]["latestDeployment"]
+
+    async def test_a_building_deployment_is_not_reported_as_stopped(self):
+        """The card itself: a build in progress must not read as a dead deploy."""
+        latest = await self._latest("BUILDING", True)
+
+        self.assertFalse(latest["deploymentStopped"],
+                         "a BUILDING deployment has no container and cannot have "
+                         "been stopped — reporting it as stopped tells an agent "
+                         "the deploy is dead while it is on its way up")
+        self.assertTrue(latest["railwayDeploymentStopped"],
+                        "Railway's own value must still be visible, not silently "
+                        "dropped")
+        self.assertIn("BUILDING", latest["deploymentStoppedNote"],
+                      "the note must say which status was corrected")
+
+    async def test_every_in_flight_status_is_corrected(self):
+        """BUILDING is the one that was seen, not the only one that can happen:
+        a deployment is equally container-less while queued or deploying."""
+        for status in server._IN_FLIGHT_STATUSES:
+            with self.subTest(status=status):
+                latest = await self._latest(status, True)
+                self.assertFalse(latest["deploymentStopped"],
+                                 f"{status} is in flight, not stopped")
+
+    async def test_a_genuinely_stopped_deployment_still_reads_as_stopped(self):
+        """Regression guard. Railway has no STOPPED status, so a service stopped
+        by stop_service is SUCCESS + deploymentStopped — the flag is the only
+        evidence there is, and a blanket false would hide every stopped service
+        again."""
+        for status in ("SUCCESS", "SLEEPING", "CRASHED", "FAILED"):
+            with self.subTest(status=status):
+                latest = await self._latest(status, True)
+                self.assertTrue(latest["deploymentStopped"],
+                                f"a {status} deployment flagged stopped must stay "
+                                "stopped — this field is how a stopped service is "
+                                "told apart from a running one")
+                self.assertNotIn("deploymentStoppedNote", latest,
+                                 "nothing was corrected, so nothing should be "
+                                 "explained away")
+
+    async def test_an_unstopped_deployment_is_left_exactly_as_it_came(self):
+        """The common case must gain no extra fields to reason about."""
+        latest = await self._latest("BUILDING", False)
+
+        self.assertFalse(latest["deploymentStopped"])
+        self.assertNotIn("railwayDeploymentStopped", latest)
+        self.assertNotIn("deploymentStoppedNote", latest)
+
+    async def test_the_description_says_an_in_flight_deploy_is_never_stopped(self):
+        """An agent reads the tool list, not this file. If the correction is not
+        described, the next reader still distrusts the field."""
+        tools = {t.name: (t.description or "").lower()
+                 for t in await server.mcp.list_tools()}
+        listing = tools["list_services"]
+
+        self.assertIn("building", listing,
+                      "the description does not mention the in-flight case at all")
+        self.assertIn("railwaydeploymentstopped", listing,
+                      "the raw value is returned but never explained")
+
+
 class DeleteServiceTest(_StubbedServer):
     """Deleting a service is the one operation here with no undo.
 
