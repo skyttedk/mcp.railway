@@ -486,7 +486,8 @@ async def get_service_instance(environment_id: str, service_id: str) -> str:
 
     `region` is the per-service override; null means the service inherits
     Railway's default region (currently US West / us-west2 for new services —
-    confirm with list_regions). Change it with set_region."""
+    confirm with list_regions). Change it with set_region, and remove it again
+    with set_region and an empty region."""
     data = await _query("""query($sid: String!, $eid: String!) {
       serviceInstance(serviceId: $sid, environmentId: $eid) {
         serviceId
@@ -571,14 +572,19 @@ def _update_rejected(data: dict, environment_id: str, service_id: str) -> str | 
 @mcp.tool()
 async def set_region(environment_id: str, service_id: str, region: str,
                redeploy: bool = False) -> str:
-    """Set the deploy region for a service in one environment.
+    """Set or clear the deploy region for a service in one environment.
 
     region is a region `name` from list_regions (e.g. "europe-west4-drams3a"),
     not the short metro `id`.
+    Pass an empty string to CLEAR the override, so the service falls back to
+    the default region again — the state get_service_instance reports as a null
+    `region`. Without this there is no way back out of an override except the
+    Railway dashboard.
     The change only takes effect on the next deploy — pass redeploy=true to
     trigger one immediately. NB: attached volumes do NOT move with the
     service; a volume stays in its own region, so check list_volumes before
-    moving a service with persistent storage.
+    moving a service with persistent storage — clearing the override is a move
+    too, back to the default region.
 
     Refuses, and writes nothing, when the service has no instance in that
     environment — Railway accepts the write silently in that case, so the
@@ -586,21 +592,31 @@ async def set_region(environment_id: str, service_id: str, region: str,
     refusal = await _instance_missing(environment_id, service_id, "set_region")
     if refusal:
         return refusal
+    # "" clears the override, sent as an explicit null — the same convention
+    # set_start_command and set_service_config use on this input, and the write
+    # side of the null get_service_instance reads back for "no override".
+    # `region` is a nullable String on ServiceInstanceUpdateInput, so the null
+    # is the reset; omitting the key would leave the override in place instead.
     data = await _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
       serviceInstanceUpdate(serviceId: $sid, environmentId: $eid, input: $input)
-    }""", {"sid": service_id, "eid": environment_id, "input": {"region": region}})
+    }""", {"sid": service_id, "eid": environment_id,
+           "input": {"region": region or None}})
     rejected = _update_rejected(data, environment_id, service_id)
     if rejected:
         return rejected
     result: dict = {"serviceId": service_id, "environmentId": environment_id,
-                    "region": region, "updated": True, "redeployed": False}
+                    "region": region or None, "cleared": not region,
+                    "updated": True, "redeployed": False}
     if redeploy:
         await _query("""mutation($sid: String!, $eid: String!) {
           serviceInstanceRedeploy(serviceId: $sid, environmentId: $eid)
         }""", {"sid": service_id, "eid": environment_id})
         result["redeployed"] = True
-    else:
+    elif region:
         result["note"] = "Region change takes effect on the next deploy."
+    else:
+        result["note"] = ("Region override cleared; the service returns to the "
+                          "default region on the next deploy.")
     return json.dumps(result)
 
 @mcp.tool()
