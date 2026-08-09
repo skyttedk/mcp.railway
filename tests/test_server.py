@@ -1885,6 +1885,82 @@ class ServiceConfigTest(_StubbedServer):
         self.assertTrue([c for c in session.calls if "serviceInstanceRedeploy" in c["query"]])
 
 
+class RegionOverrideTest(_StubbedServer):
+    """A region override has to be removable, not just settable.
+
+    set_region could only ever write a region name, so once a service had an
+    override the only way back to the default region was the Railway dashboard
+    — the tool that made the change could not undo it. The clear is the same ""
+    convention set_start_command and set_service_config already use, and it has
+    to travel as an explicit null: `region` is a nullable String on
+    ServiceInstanceUpdateInput, and leaving the key out means "untouched", not
+    "reset".
+    """
+
+    _ROUTE = {"serviceInstanceUpdate": {"serviceInstanceUpdate": True},
+              "serviceInstance(serviceId": {
+                  "serviceInstance": {"serviceId": "svc1", "serviceName": "web"}}}
+
+    @staticmethod
+    def _sent(session: _FakeSession) -> dict:
+        writes = [c for c in session.calls if "serviceInstanceUpdate" in c["query"]]
+        assert len(writes) == 1, f"expected one write, got {len(writes)}"
+        return writes[0]["variables"]["input"]
+
+    async def _set(self, session_routes: dict, region: str, **extra) -> tuple[dict, _FakeSession]:
+        session = self.install(session_routes)
+        args = {"environment_id": "e1", "service_id": "svc1", "region": region}
+        args.update(extra)
+        return json.loads(await _text(server.mcp.call_tool("set_region", args))), session
+
+    async def test_a_region_name_is_still_written(self):
+        """The existing path must be untouched by the clear."""
+        result, session = await self._set(self._ROUTE, "europe-west4-drams3a")
+
+        self.assertEqual({"region": "europe-west4-drams3a"}, self._sent(session))
+        self.assertEqual("europe-west4-drams3a", result["region"])
+        self.assertFalse(result["cleared"])
+        self.assertTrue(result["updated"])
+        self.assertIn("next deploy", result["note"])
+
+    async def test_an_empty_region_clears_the_override(self):
+        """The key must be present and null. An omitted key leaves Railway's
+        stored override exactly where it was, which is the bug this fixes."""
+        result, session = await self._set(self._ROUTE, "")
+
+        sent = self._sent(session)
+        self.assertIn("region", sent,
+                      "the key was dropped, so the override was left in place")
+        self.assertIsNone(sent["region"])
+        self.assertIsNone(result["region"])
+        self.assertTrue(result["cleared"])
+        self.assertTrue(result["updated"])
+        self.assertIn("default region", result["note"])
+
+    async def test_clearing_still_refuses_a_missing_service_instance(self):
+        """The clear is a serviceInstanceUpdate like any other, so it inherits
+        the guard — Railway accepts it silently for an absent instance too."""
+        absent = {**self._ROUTE, "serviceInstance(serviceId": {"serviceInstance": None}}
+        result, session = await self._set(absent, "")
+
+        self.assertNotIn("updated", result)
+        self.assertIn("svc1", result["error"])
+        self.assertIn("e1", result["error"])
+        self.assertEqual([], [c for c in session.calls
+                              if "serviceInstanceUpdate" in c["query"]])
+
+    async def test_clearing_can_redeploy_immediately(self):
+        result, session = await self._set(
+            {**self._ROUTE,
+             "serviceInstanceRedeploy": {"serviceInstanceRedeploy": True}},
+            "", redeploy=True)
+
+        self.assertTrue(result["cleared"])
+        self.assertTrue(result["redeployed"])
+        self.assertTrue([c for c in session.calls
+                         if "serviceInstanceRedeploy" in c["query"]])
+
+
 class MissingServiceInstanceTest(_StubbedServer):
     """Regression: config writes reported success for an instance that was not
     there.
