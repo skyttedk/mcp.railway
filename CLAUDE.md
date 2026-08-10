@@ -194,6 +194,21 @@ cheapest liveness check.
   — what `start_service` uses, and what actually brought the service back — and
   names the mutation it used in `method`. `ContainerLivenessTest` pins the
   accusation, every non-accusation, and both restart paths.
+- **A metrics series is not always a deployment's.** `metrics(groupBy:
+  [DEPLOYMENT_ID])` reads as one series per deployment, and for CPU/memory it is
+  — but volume-scoped measurements (`DISK_USAGE_GB`, `BACKUP_USAGE_GB`) belong to
+  no deployment and arrive in the same list tagged `deploymentId: null`. Observed
+  2026-08-10 on `mcp.google`: a memory series with the running deployment's id
+  and a disk series with a null one, in a single answer. Nothing is broken — the
+  volume outlives every deployment, so there is no id to give it. The rule for
+  callers is therefore **aggregate, do not attribute**: filtering to one
+  deploymentId drops the untagged series, and reading the untagged series as a
+  deployment's usage credits stored bytes to a process. `_container_probe` is the
+  working example (unions every series, never reads `tags`), and its measurement
+  list is load-bearing for the same reason — adding a disk measurement would let
+  a volume's bytes read as a live container. Documented above `get_metrics` and in
+  its docstring; re-check if a later Railway API version starts attributing
+  volume metrics.
 - **A deployment has two log queries, and the failure you care about is in the
   other one.** `buildLogs(deploymentId:)` is the builder's output and
   `deploymentLogs(deploymentId:)` is the container's. They take identical
