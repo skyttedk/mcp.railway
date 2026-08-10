@@ -131,9 +131,13 @@ cheapest liveness check.
   with `Not Authorized`. `DEFAULT_PROJECT` now reads `MCP_DEFAULT_PROJECT_ID`
   first and only falls back to the reserved name, which is what keeps the
   skyttedk service — which pins nothing — working exactly as before. Deploy-side:
-  the riskwave service needs `MCP_DEFAULT_PROJECT_ID` set to the `riskwave-app`
+  the riskwave service now has `MCP_DEFAULT_PROJECT_ID` set to the `riskwave-app`
   project id (`7b8d2d41-8854-4742-bfff-dbfd946c2202`, chosen by the owner
-  2026-08-06); until it is, pass `project_id` explicitly to that namespace.
+  2026-08-06), so a `railway_riskwave_*` call may omit `project_id` and lands in
+  `riskwave-app` (re-verified 2026-08-10: `list_services` with no `project_id`
+  returns that project's services). Only pass `project_id` to reach one of the
+  account's *other* projects. The skyttedk service still pins nothing and keeps
+  using the injected value.
 - **A tool's failure is explained at the boundary, not in the tool.** Everything
   raised out of `_query_sync` is a `RailwayCallError` whose `str()` is already
   the finished sentence `_why` produces — so all 37 tools report a refused
