@@ -248,6 +248,26 @@ consumed one entry per matching call, with the last entry repeating. Reach for
 it only when a test genuinely needs two answers to one query; a single payload
 is clearer everywhere else.
 
+## `RegionMetroGroupingTest` — thirteen names, five places
+
+`list_regions` returned Railway's flat array, in which the shared metro code
+arrives in a field called `id` — a name that reads like a row key while in fact
+four rows carry `iad`. So `us-east4-eqdc4a`, `us-east-1`, `us-east4` and
+`us-east4-eqdc16a` are one datacentre, and two services deliberately placed in
+"different regions" could sit in the same rack with nothing in the answer to
+say so. The response is now `{metros, regions, note}`: one entry per place with
+its interchangeable names, every original row kept beside it, and the two counts
+stated. The tests check the live 13-across-5 shape end to end, that no name is
+lost in the fold, and that a row is Railway's own plus `metro_id`. Two guard the
+traps rather than the feature: the grouping key is Railway's `id` and never
+anything parsed out of a region name, because the names are Railway's to change
+and a parser would keep answering confidently after they did; and `location` is
+not the key either, since `sfo` (California) and `pdx` (Oregon) are both
+labelled "US West" and merging them would claim a service can cross the country
+for free. The last one holds the description, not the data — a caller picking a
+region from the tool list may never read a response, so the concrete aliases
+have to be legible there too.
+
 ## After an intended change to a tool's arguments
 
 The contract test fails on purpose. Confirm the change is wanted, then:

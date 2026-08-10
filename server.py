@@ -521,16 +521,31 @@ async def list_services(project_id: str = "") -> str:
 
 @mcp.tool()
 async def list_regions() -> str:
-    """List the deploy regions available to this Railway account.
+    """List the deploy regions available to this Railway account, grouped by the
+    physical metro each one sits in.
 
-    Returns [{id, name, location, country, region}]. Pass the `name` value
-    (e.g. "europe-west4-drams3a", "us-west2") to set_region or create_volume.
-    The short `id` ("ams", "sfo") is the metro code several names share;
-    set_region accepts it as well (verified live 2026-08-10), but `name` is the
-    unambiguous one — one metro can carry several, e.g. ams covers both
-    europe-west4 and europe-west4-drams3a."""
+    There are far more region names than places: today 13 names across 5 metros,
+    so most of the list is aliases. Railway's `id` is the metro code and it
+    REPEATS across rows — `us-east4-eqdc4a`, `us-east-1`, `us-east4` and
+    `us-east4-eqdc16a` are all `iad`, one datacentre. Read as a flat list that
+    is easy to miss, and two services put in "different regions" can turn out to
+    be in the same rack.
+
+    So the answer is `{metros, regions, note}` rather than a bare list.
+    `metros` has one entry per place — {metro_id, location, country, region,
+    names} — and `names` are that metro's interchangeable region names. Each row
+    in `regions` is Railway's own {id, name, location, country, region} plus
+    `metro_id`, a spelled-out copy of `id` (the name `id` reads like a row key,
+    which is exactly the misreading this tool exists to prevent).
+
+    Pass a `name` (e.g. "europe-west4-drams3a", "us-west2") to set_region or
+    create_volume — a metro id passed where a region name belongs is a known way
+    to leave a service unable to deploy, so prefer `name` even though set_region
+    took the short id when that was tried (2026-08-10). Do not group by
+    `location` either: `sfo` (California) and `pdx` (Oregon) are two metros both
+    labelled "US West"."""
     data = await _query("query { regions { id name location country region } }")
-    return json.dumps(data["regions"])
+    return json.dumps(_group_regions_by_metro(data["regions"]))
 
 
 @mcp.tool()
@@ -2286,6 +2301,46 @@ async def delete_service(service_id: str = "", name: str = "",
         "note": f"Service {target['name']} ({target['id']}) was permanently deleted, "
                 "with its deployments, variables, domains and volumes. This cannot "
                 "be undone."})
+
+
+# ── a region name is not a place ─────────────────────────────────────
+
+def _group_regions_by_metro(rows: list[dict]) -> dict:
+    """Turn Railway's flat region list into {metros, regions, note}.
+
+    Railway's `id` is the metro code, shared by every name in that metro, so
+    grouping on it is a plain fold — nothing here is inferred from the region
+    name. Railway's order is preserved (metros by first appearance, names within
+    a metro as listed) so the answer does not reshuffle between calls, and each
+    original row is passed through untouched apart from the added `metro_id`.
+    """
+    metros: dict = {}
+    regions = []
+    for row in rows:
+        metro_id = row.get("id")
+        regions.append({**row, "metro_id": metro_id})
+        metro = metros.get(metro_id)
+        if metro is None:
+            metro = metros[metro_id] = {
+                "metro_id": metro_id,
+                "location": row.get("location"),
+                "country": row.get("country"),
+                "region": row.get("region"),
+                "names": [],
+            }
+        metro["names"].append(row.get("name"))
+
+    return {
+        "metros": list(metros.values()),
+        "regions": regions,
+        "note": (
+            f"{len(regions)} region names across {len(metros)} physical metros — "
+            "every name under one `metro_id` is the same datacentre, so choosing "
+            "between them does not move a service. `metro_id` repeats across "
+            "`regions` rows on purpose; it is not a row key. Group by it, never "
+            "by `location`, which two different metros can share."
+        ),
+    }
 
 
 # ── domain tools ────────────────────────────────────────────────────

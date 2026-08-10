@@ -346,6 +346,19 @@ cheapest liveness check.
   **introspection without a token**, which is how all of this was established
   from a checkout that has no credentials — reach for it before guessing at a
   field.
+- **Region names outnumber places roughly three to one, and Railway's field
+  naming hides it.** 13 names across 5 metros; the metro code arrives as `id`,
+  which reads like a row key but repeats — `us-east4-eqdc4a`, `us-east-1`,
+  `us-east4` and `us-east4-eqdc16a` are all `iad`, one datacentre. `list_regions`
+  therefore no longer returns Railway's flat array: it answers
+  `{metros, regions, note}`, where `metros` is one entry per place with its
+  interchangeable `names` and `regions` is every original row plus an explicit
+  `metro_id`. **This is a response-shape change** — a caller that indexed the
+  top-level array now wants `["regions"]`. Calls reach the new code as soon as
+  the service redeploys, but the gateway caches tool *descriptions*, so restart
+  it too or agents keep reading the old one. Group on `metro_id`,
+  never on `location`: `sfo` (California) and `pdx` (Oregon) both say "US West".
+  `RegionMetroGroupingTest` pins the fold, the traps, and the docstring wording.
 - **An explicit null is dropped where a value is kept — clearing is its own
   defect, separate from the region one above.** Live on `mcp.reddit`
   2026-08-10: `set_build_command ""` and `set_healthcheck ""` both reported
