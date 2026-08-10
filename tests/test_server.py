@@ -2999,6 +2999,148 @@ class MissingDefaultProjectTest(_StubbedServer):
         self.assertIn("Nothing was deleted", result["error"])
 
 
+class RegionMetroGroupingTest(_StubbedServer):
+    """list_regions lists names, and most of them are the same place twice.
+
+    Railway returns 13 region names across 5 metros, so two thirds of the list
+    are aliases: `us-east4-eqdc4a`, `us-east-1`, `us-east4` and
+    `us-east4-eqdc16a` are one datacentre. The old answer was Railway's flat
+    array, where the shared metro code arrives in a field called `id` — a name
+    that reads like a row key — so two services deliberately put in "different
+    regions" could sit in the same rack with nothing in the output to say so.
+
+    The tests hold the answer to grouping on Railway's own `id` rather than on
+    anything parsed out of a region name, and to keeping every original row
+    intact beside the grouping, since the grouping is the summary and the rows
+    are still the thing you pass to set_region. Two of them guard the traps:
+    `location` is NOT the grouping key, because `sfo` (California) and `pdx`
+    (Oregon) are two metros both labelled "US West" and folding them together
+    would claim a service can move between coasts for free; and the metro code
+    must never be inferred from the name, because the names are Railway's to
+    change and a parser would keep answering confidently after they did.
+    """
+
+    # Railway's live answer for the skyttedk account, 2026-08-10 — 13 names,
+    # 5 metros. Kept verbatim so the grouping is checked against the shape the
+    # card describes rather than an invented one.
+    _LIVE = [
+        {"id": "sfo", "name": "us-west2", "location": "US West",
+         "country": "USA", "region": "California"},
+        {"id": "sfo", "name": "us-west2-aws", "location": "US West",
+         "country": "USA", "region": "California"},
+        {"id": "sfo", "name": "us-west2-cssv9a", "location": "US West",
+         "country": "USA", "region": "California"},
+        {"id": "iad", "name": "us-east4-eqdc4a", "location": "US East",
+         "country": "USA", "region": "Virginia"},
+        {"id": "iad", "name": "us-east-1", "location": "US East",
+         "country": "USA", "region": "Virginia"},
+        {"id": "iad", "name": "us-east4", "location": "US East",
+         "country": "USA", "region": "Virginia"},
+        {"id": "iad", "name": "us-east4-eqdc16a", "location": "US East",
+         "country": "USA", "region": "Virginia"},
+        {"id": "sin", "name": "asia-southeast1-eqsg3a",
+         "location": "Southeast Asia", "country": "Singapore",
+         "region": "Singapore"},
+        {"id": "sin", "name": "asia-southeast1", "location": "Southeast Asia",
+         "country": "Singapore", "region": "Singapore"},
+        {"id": "pdx", "name": "us-west1", "location": "US West",
+         "country": "USA", "region": "Oregon"},
+        {"id": "ams", "name": "europe-west4-drams3a", "location": "EU West",
+         "country": "Netherlands", "region": "Amsterdam"},
+        {"id": "ams", "name": "europe-west4", "location": "EU West",
+         "country": "Netherlands", "region": "Amsterdam"},
+        {"id": "ams", "name": "europe-west4-drams11a", "location": "EU West",
+         "country": "Netherlands", "region": "Amsterdam"},
+    ]
+
+    async def _list(self, rows: list[dict] | None = None) -> dict:
+        self.install({"regions {": {"regions": self._LIVE if rows is None else rows}})
+        return json.loads(await _text(server.mcp.call_tool("list_regions", {})))
+
+    async def test_the_live_thirteen_names_collapse_to_five_metros(self):
+        """The card's own numbers, end to end: whatever else the answer says,
+        a caller must be able to see that there are only five places."""
+        result = await self._list()
+
+        self.assertEqual(
+            [("sfo", ["us-west2", "us-west2-aws", "us-west2-cssv9a"]),
+             ("iad", ["us-east4-eqdc4a", "us-east-1", "us-east4",
+                      "us-east4-eqdc16a"]),
+             ("sin", ["asia-southeast1-eqsg3a", "asia-southeast1"]),
+             ("pdx", ["us-west1"]),
+             ("ams", ["europe-west4-drams3a", "europe-west4",
+                      "europe-west4-drams11a"])],
+            [(m["metro_id"], m["names"]) for m in result["metros"]],
+            "metros must appear in Railway's order, each carrying every one of "
+            "its interchangeable names")
+        self.assertEqual(13, len(result["regions"]))
+
+    async def test_every_name_survives_the_grouping(self):
+        """A summary that loses a row is worse than no summary: the names are
+        what set_region and create_volume are actually given."""
+        result = await self._list()
+
+        grouped = [n for m in result["metros"] for n in m["names"]]
+        self.assertEqual([r["name"] for r in self._LIVE], grouped)
+
+    async def test_each_row_is_railways_own_plus_metro_id(self):
+        """The grouping is added, not substituted. Every field Railway sent is
+        still on the row, so nothing that read the old list loses data — and
+        `metro_id` spells out what `id` already held, because `id` is the field
+        that gets mistaken for a row key."""
+        result = await self._list()
+
+        for original, row in zip(self._LIVE, result["regions"]):
+            self.assertEqual({**original, "metro_id": original["id"]}, row)
+
+    async def test_two_metros_sharing_a_location_stay_apart(self):
+        """`sfo` and `pdx` are both "US West" and are 900 km apart. Grouping by
+        the human label instead of the metro code would merge California and
+        Oregon and report four places where there are five."""
+        result = await self._list()
+
+        by_id = {m["metro_id"]: m for m in result["metros"]}
+        self.assertEqual("California", by_id["sfo"]["region"])
+        self.assertEqual("Oregon", by_id["pdx"]["region"])
+        self.assertEqual(["us-west1"], by_id["pdx"]["names"])
+        self.assertNotIn("us-west1", by_id["sfo"]["names"])
+
+    async def test_the_metro_comes_from_railway_not_from_the_name(self):
+        """Region names are Railway's to rename, and a name-shaped guess would
+        go on answering confidently after they did. A row that Railway says is
+        `ams` belongs to `ams` however much its name looks like us-east4."""
+        result = await self._list([
+            {"id": "ams", "name": "us-east4-lookalike", "location": "EU West",
+             "country": "Netherlands", "region": "Amsterdam"},
+        ])
+
+        self.assertEqual(["ams"], [m["metro_id"] for m in result["metros"]])
+        self.assertEqual(["us-east4-lookalike"], result["metros"][0]["names"])
+
+    async def test_the_note_counts_both_names_and_places(self):
+        """The gap between the two numbers is the whole finding, and an agent
+        reading only the first line of the answer should still meet it."""
+        result = await self._list()
+
+        self.assertIn("13", result["note"])
+        self.assertIn("5", result["note"])
+
+    def test_the_description_warns_before_the_answer_is_read(self):
+        """A caller choosing a region from the tool list may never look at a
+        response. The one-to-many relationship has to be legible from the
+        description alone, so these words are part of the fix, not decoration."""
+        description = server.mcp._tool_manager.get_tool("list_regions").description
+
+        self.assertIn("metro", description)
+        for word in ("us-east4-eqdc4a", "us-east-1", "iad"):
+            self.assertIn(word, description,
+                          "the description must show the concrete aliases — "
+                          "an abstract warning is one nobody applies")
+        self.assertIn("location", description,
+                      "and must say not to group by location, since two metros "
+                      "share the label 'US West'")
+
+
 async def _text(call) -> str:
     """Pull the tool's string return value out of whatever call_tool answers.
 
