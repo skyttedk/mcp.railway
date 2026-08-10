@@ -524,8 +524,11 @@ async def list_regions() -> str:
     """List the deploy regions available to this Railway account.
 
     Returns [{id, name, location, country, region}]. Pass the `name` value
-    (e.g. "europe-west4-drams3a", "us-west2") to set_region or create_volume —
-    NOT the short `id` ("ams", "sfo"), which is just the metro code."""
+    (e.g. "europe-west4-drams3a", "us-west2") to set_region or create_volume.
+    The short `id` ("ams", "sfo") is the metro code several names share;
+    set_region accepts it as well (verified live 2026-08-10), but `name` is the
+    unambiguous one — one metro can carry several, e.g. ams covers both
+    europe-west4 and europe-west4-drams3a."""
     data = await _query("query { regions { id name location country region } }")
     return json.dumps(data["regions"])
 
@@ -631,8 +634,15 @@ async def set_region(environment_id: str, service_id: str, region: str,
                redeploy: bool = False) -> str:
     """Set or clear the deploy region for a service in one environment.
 
-    region is a region `name` from list_regions (e.g. "europe-west4-drams3a"),
-    not the short metro `id`.
+    region is a region `name` from list_regions (e.g. "europe-west4-drams3a").
+    The short metro `id` ("ams", "sfo", …) is accepted too — verified live
+    2026-08-10, both forms passed Railway's validation on the same service —
+    so an earlier version of this text was wrong to forbid it. Trust the
+    rejection message rather than either claim if they ever disagree: it names
+    exactly what that Railway API build accepts. Note that message lists ONLY
+    the metro ids ("Available regions are: [iad, sin, pdx, ams, sfo]") even
+    though the long names work, so a rejection is not evidence that the long
+    name you sent was the wrong format — check for a typo first.
     Pass an empty string to CLEAR the override, so the service falls back to
     the default region again — the state get_service_instance reports as a null
     `region`. Without this there is no way back out of an override except the
