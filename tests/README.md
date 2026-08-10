@@ -221,6 +221,33 @@ write was refused, to leaving room for the advice specific to one tool
 (`delete_service` needs no project at all when given an id), and to costing no
 round trip.
 
+## `RegionOverrideTest` — a write Railway accepts and throws away
+
+Railway answers `true` to a flat `region` write on `serviceInstanceUpdate` and
+stores nothing, so the mutation's own boolean — the only signal `set_region`
+ever had — is not evidence a region changed. Confirmed live on a decommissioned
+service with two different valid region names, while `numReplicas`,
+`healthcheckPath` and `buildCommand` through the same mutation on the same
+instance all read back fine, and against all 45 instances in both accounts,
+where the field is null everywhere. The tests hold `set_region` to reading the
+value back and reporting the truth: a dropped write is an error naming both the
+value sent and the value observed (neither alone tells the next reader which
+layer to look at), the calls happen in read-write-read order so the check
+cannot be satisfied by the guard read the tool already made, a failed
+verification skips the redeploy rather than restarting a service to pick up a
+change that was never stored, and a read-back that itself fails is its own
+third outcome — the write went out and nobody knows whether it landed, which
+is not success. The older pair still pin the clear: `""` must travel as an
+explicit null, since an omitted key means "untouched", and the clear inherits
+the missing-instance guard.
+
+Because both the guard read and the verify read are the same
+`serviceInstance(serviceId:` query, substring routing alone cannot say "answer
+differently the second time" — so a `_FakeSession` route value may be a **list**,
+consumed one entry per matching call, with the last entry repeating. Reach for
+it only when a test genuinely needs two answers to one query; a single payload
+is clearer everywhere else.
+
 ## After an intended change to a tool's arguments
 
 The contract test fails on purpose. Confirm the change is wanted, then:

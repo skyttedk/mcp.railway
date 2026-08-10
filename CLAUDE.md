@@ -71,8 +71,8 @@ py -3.12 -m venv .venv
 The suite is stdlib `unittest`, so there is no test framework to install, but it
 imports `server.py` and therefore needs `requirements.txt` installed. It needs no
 Railway credentials and never contacts the Railway API: it swaps `server._session`
-for a fake at the HTTP boundary and refuses any call that forgets to. **128 tests,
-0.82 s, verified 2026-08-09** on Python 3.12.10. `tests/README.md` explains what
+for a fake at the HTTP boundary and refuses any call that forgets to. **143 tests,
+0.91 s, verified 2026-08-10** on Python 3.12.10. `tests/README.md` explains what
 each class is protecting and why.
 
 GitHub Actions runs the same command on every push and pull request
@@ -310,6 +310,54 @@ cheapest liveness check.
   payload would wipe a setting the caller never mentioned. Hence the split:
   `None` means untouched, `""` clears a string, `[]` clears a list and is sent
   as `[]` rather than collapsed to null. `ServiceConfigTest` pins all four.
+- **`serviceInstanceUpdate` returning `true` does not mean it stored anything,
+  and `region` is the field where that bites.** Railway accepts the flat
+  `region` string on that input, answers success, and drops it. Verified live
+  2026-08-10 against the decommissioned `mcp.reddit`: `europe-west4-drams3a`
+  and `us-west2` (one of the four names Railway's own staff call valid) each
+  came back `updated: true` and each read back as no override, unchanged four
+  minutes later. It is not the mutation being broken — `numReplicas`,
+  `healthcheckPath` and `buildCommand` written through the SAME mutation on the
+  SAME instance read back correctly — and it is not a stale read: `region` is
+  null on **all 45 service instances across both accounts**, so nothing in the
+  fleet has ever demonstrated the field carrying a value. `set_region`
+  therefore reads the value back through `_write_unconfirmed` and returns an
+  error naming what it sent versus what Railway reports, rather than the
+  success it invented for as long as it existed. The tool cannot move a
+  service; the dashboard can. `RegionOverrideTest` pins the dropped write, the
+  three-call read-write-read order, that a failed verification skips the
+  redeploy, and the third outcome where the read-back itself fails (write sent,
+  landing unknown — reporting that as success is the original bug in a hat).
+  **Where region actually lives now is `multiRegionConfig`**, a JSON map of
+  region name to replica count on the same input; Railway's own rejection text
+  points there ("clear it by setting its key to null in multiRegionConfig") and
+  their forum says flat `numReplicas` is deprecated in its favour. Two things
+  must be solved before this server writes it, and neither is a code detail:
+  it is **write-only** — introspecting all 609 types in the schema, nothing
+  exposes it for reading, so `ServiceInstance.region` (the field being dropped)
+  is the only readable region signal there is — and **a wrong key in it bricks
+  the service**, a metro id instead of a region name making every later
+  deployment fail with "configured with an invalid region", which a Railway
+  employee had to clear by hand for the user who hit it. An unverifiable write
+  whose failure mode needs vendor support to undo is worse than an honest
+  refusal. Note the consequence for clearing: a `set_region ""` reports success
+  because the readable field does say "no override", but that cannot promise a
+  region stuck in multiRegionConfig is gone. Railway's GraphQL answers
+  **introspection without a token**, which is how all of this was established
+  from a checkout that has no credentials — reach for it before guessing at a
+  field.
+- **An explicit null is dropped where a value is kept — clearing is its own
+  defect, separate from the region one above.** Live on `mcp.reddit`
+  2026-08-10: `set_build_command ""` and `set_healthcheck ""` both reported
+  success and changed nothing, while `set_num_replicas 1` through the identical
+  mutation seconds later landed. An earlier session saw the same on two
+  independent code paths and wondered whether its own argument serialization
+  was at fault — it was not, this reproduces cleanly. So there are two distinct
+  Railway behaviours, not one: nulls dropped on clearable string fields, and
+  `region` dropped even when non-null. `_write_unconfirmed` is written
+  generically for exactly this reason and is deliberately **not** yet wired
+  into the other setters — that is its own card, and until it is done every
+  `""` clear on this input still reports a success it has not checked.
 - **`serviceInstanceUpdate` does not object to a service instance that is not
   there, so every setter has to look first.** Config belongs to the service
   *instance* — one per environment — not to the service, so a service can exist
