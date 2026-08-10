@@ -629,29 +629,102 @@ def _update_rejected(data: dict, environment_id: str, service_id: str) -> str | 
     return None
 
 
+# `serviceInstanceUpdate` answers `true` for a write it accepted and then
+# ignored, so its boolean is not evidence that anything changed — which is how
+# set_region reported success for two months while changing nothing. Reading
+# the field back is the only evidence available, and it is immediate: a
+# healthcheckPath, a buildCommand and a numReplicas written through this same
+# mutation all read back correctly within the same call sequence, so there is
+# no lag to tolerate and no retry to add.
+#
+# Deliberately generic, and deliberately not yet wired into the other setters:
+# `set_build_command`'s clear path shows the same symptom and is its own card,
+# so this is shaped to be reused there rather than being about region alone.
+async def _write_unconfirmed(environment_id: str, service_id: str, field: str,
+                             expected, action: str, hint: str = "") -> str | None:
+    """Re-read one service-instance field after a write. None when it landed.
+
+    Compares against `expected` — the value the caller asked for, with None
+    meaning "no override". Returns the refusal to hand back otherwise, naming
+    what was sent and what Railway actually reports, because "it did not work"
+    without those two values sends the next reader to the wrong layer.
+
+    A verify query that fails is reported as its own outcome rather than as
+    success: the write was already sent, so the honest answer is that nobody
+    knows whether it landed, not that it did.
+    """
+    try:
+        data = await _query(f"""query($sid: String!, $eid: String!) {{
+          serviceInstance(serviceId: $sid, environmentId: $eid) {{ {field} }}
+        }}""", {"sid": service_id, "eid": environment_id})
+    except RuntimeError as exc:
+        return json.dumps({
+            "error": f"{action} sent the change for service {service_id} in "
+                     f"environment {environment_id}, but Railway would not "
+                     f"confirm it afterwards: {exc}. The write may or may not "
+                     f"have landed — read {field} with get_service_instance "
+                     "before assuming either.",
+            "sent": expected, "verified": False})
+    observed = (data.get("serviceInstance") or {}).get(field)
+    if observed == expected:
+        return None
+    return json.dumps({
+        "error": f"{action} was accepted by Railway and then silently dropped: "
+                 f"it asked for {field}={expected!r} on service {service_id} in "
+                 f"environment {environment_id}, Railway's mutation answered "
+                 f"success, but reading the service back immediately reports "
+                 f"{field}={observed!r}. Nothing was changed." + (f" {hint}" if hint else ""),
+        "sent": expected, "observed": observed, "verified": False})
+
+
 @mcp.tool()
 async def set_region(environment_id: str, service_id: str, region: str,
                redeploy: bool = False) -> str:
     """Set or clear the deploy region for a service in one environment.
 
-    region is a region `name` from list_regions (e.g. "europe-west4-drams3a").
-    The short metro `id` ("ams", "sfo", …) is accepted too — verified live
-    2026-08-10, both forms passed Railway's validation on the same service —
-    so an earlier version of this text was wrong to forbid it. Trust the
-    rejection message rather than either claim if they ever disagree: it names
-    exactly what that Railway API build accepts. Note that message lists ONLY
-    the metro ids ("Available regions are: [iad, sin, pdx, ams, sfo]") even
-    though the long names work, so a rejection is not evidence that the long
-    name you sent was the wrong format — check for a typo first.
-    Pass an empty string to CLEAR the override, so the service falls back to
-    the default region again — the state get_service_instance reports as a null
-    `region`. Without this there is no way back out of an override except the
-    Railway dashboard.
-    The change only takes effect on the next deploy — pass redeploy=true to
-    trigger one immediately. NB: attached volumes do NOT move with the
-    service; a volume stays in its own region, so check list_volumes before
-    moving a service with persistent storage — clearing the override is a move
-    too, back to the default region.
+    KNOWN BROKEN ON RAILWAY'S SIDE — this tool currently cannot move a service.
+    Railway accepts the region write, answers success, and ignores it. That is
+    not a claim about some past API version: verified live 2026-08-10 against
+    a decommissioned service, with "europe-west4-drams3a" and with "us-west2"
+    (one of the four names Railway's own staff call valid), each answered
+    `updated: true` and each reading back as no override at all. Nor is it this
+    mutation being broken generally — `numReplicas`, `healthcheckPath` and
+    `buildCommand` written through the SAME mutation on the SAME instance read
+    back correctly. The drop is specific to `region`. Setting a region
+    therefore now RETURNS AN ERROR naming what was asked for and what Railway
+    actually reports, instead of the success it used to invent; that error is
+    the tool working as intended, and there is nothing to retry. Move a service
+    from the Railway dashboard until this changes.
+
+    region is a region `name` from list_regions (e.g. "europe-west4-drams3a");
+    the short metro `id` ("ams", "sfo", …) passes Railway's validation too.
+    Both are moot while the write is dropped, but the validation is real, so a
+    rejection still means a bad value rather than this defect.
+    Pass an empty string to CLEAR the override. A clear still reports success,
+    and honestly so — it verifies the END STATE, and every service in both
+    accounts already reads back as "no override" (45 of 45 checked). It does
+    NOT prove a stuck region was removed: see the multiRegionConfig note below.
+    The change would only take effect on the next deploy — pass redeploy=true
+    to trigger one immediately; a redeploy is skipped when verification fails,
+    so a dropped write never costs a pointless deployment. NB: attached volumes
+    do NOT move with the service; a volume stays in its own region, so check
+    list_volumes before moving a service with persistent storage — clearing the
+    override is a move too, back to the default region.
+
+    Why this is not simply pointed at a different field: region control has
+    moved to `multiRegionConfig`, a JSON map of region name to replica count on
+    the same input, and Railway's own rejection text points there ("clear it by
+    setting its key to null in multiRegionConfig"). This server does not write
+    it, for two reasons that both have to be fixed before it can. It is
+    WRITE-ONLY — introspecting all 609 types in Railway's schema, nothing
+    exposes multiRegionConfig for reading, so a write to it could never be
+    confirmed and this tool would be back to guessing. And a wrong key in it
+    BRICKS the service: a metro id instead of a region name makes every later
+    deployment fail with "configured with an invalid region", a state a
+    Railway employee had to clear by hand for the user who hit it. An
+    unverifiable write whose failure mode is unrecoverable is worse than an
+    honest refusal. That is also why a "cleared" result cannot promise a region
+    stuck in multiRegionConfig is gone — nothing here can see that map.
 
     Refuses, and writes nothing, when the service has no instance in that
     environment — Railway accepts the write silently in that case, so the
@@ -671,9 +744,21 @@ async def set_region(environment_id: str, service_id: str, region: str,
     rejected = _update_rejected(data, environment_id, service_id)
     if rejected:
         return rejected
+    # The mutation's `true` means "accepted", not "applied", so it is not
+    # evidence on its own — see _write_unconfirmed. Verified BEFORE any
+    # redeploy: triggering a deployment to pick up a change that was never
+    # stored just moves the surprise later.
+    unconfirmed = await _write_unconfirmed(
+        environment_id, service_id, "region", region or None, "set_region",
+        hint="Railway ignores the flat `region` field on serviceInstanceUpdate; "
+             "region control has moved to the write-only `multiRegionConfig`, "
+             "which this server cannot safely drive. Move the service from the "
+             "Railway dashboard.")
+    if unconfirmed:
+        return unconfirmed
     result: dict = {"serviceId": service_id, "environmentId": environment_id,
                     "region": region or None, "cleared": not region,
-                    "updated": True, "redeployed": False}
+                    "updated": True, "verified": True, "redeployed": False}
     if redeploy:
         await _query("""mutation($sid: String!, $eid: String!) {
           serviceInstanceRedeploy(serviceId: $sid, environmentId: $eid)
@@ -682,8 +767,12 @@ async def set_region(environment_id: str, service_id: str, region: str,
     elif region:
         result["note"] = "Region change takes effect on the next deploy."
     else:
-        result["note"] = ("Region override cleared; the service returns to the "
-                          "default region on the next deploy.")
+        result["note"] = ("No region override is set; the service runs in the "
+                          "default region. Read back and confirmed — but that "
+                          "confirms only the readable `region` field, which is "
+                          "also what a service that never had an override "
+                          "reports. A region stuck in Railway's write-only "
+                          "multiRegionConfig cannot be seen or cleared here.")
     return json.dumps(result)
 
 @mcp.tool()

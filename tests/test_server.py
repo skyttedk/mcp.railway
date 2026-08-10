@@ -140,6 +140,14 @@ class _FakeSession:
     GraphQL error (the kind `_query_sync` turns into a RuntimeError). A route
     value that is an Exception is raised instead, which is how a test asks for
     the failures that never reach GraphQL at all: an HTTP 401, a timeout.
+
+    A route value that is a LIST is consumed one entry per matching call, and
+    the last entry keeps answering once the list runs out. Substring routing
+    alone cannot express "the same query answers differently the second time",
+    which is exactly what a write followed by a read-back verification needs:
+    both the guard read and the verify read are `serviceInstance(serviceId:`.
+    Each entry is then interpreted by the rules above, so a sequence can mix
+    payloads, GraphQL errors and exceptions.
     """
 
     def __init__(self, routes: dict[str, dict], delay: float = 0.0):
@@ -155,6 +163,8 @@ class _FakeSession:
             time.sleep(self.delay)
         for marker, data in self.routes.items():
             if marker in query:
+                if isinstance(data, list):
+                    data = data[0] if len(data) == 1 else data.pop(0)
                 if isinstance(data, Exception):
                     raise data
                 return _FakeResponse(data if "errors" in data else {"data": data})
@@ -1992,9 +2002,23 @@ class RegionOverrideTest(_StubbedServer):
     "reset".
     """
 
+    # The guard read, the verify read and get_service_instance are the same
+    # `serviceInstance(serviceId:` query, so one route answers all three; what
+    # the payload's `region` says is therefore what Railway "stored". A route
+    # whose region equals the value being written is a Railway that kept it;
+    # one that stays null is the live defect.
     _ROUTE = {"serviceInstanceUpdate": {"serviceInstanceUpdate": True},
               "serviceInstance(serviceId": {
-                  "serviceInstance": {"serviceId": "svc1", "serviceName": "web"}}}
+                  "serviceInstance": {"serviceId": "svc1", "serviceName": "web",
+                                      "region": None}}}
+
+    @staticmethod
+    def _stored(region) -> dict:
+        """A Railway that actually keeps what set_region writes."""
+        return {"serviceInstanceUpdate": {"serviceInstanceUpdate": True},
+                "serviceInstance(serviceId": {
+                    "serviceInstance": {"serviceId": "svc1", "serviceName": "web",
+                                        "region": region}}}
 
     @staticmethod
     def _sent(session: _FakeSession) -> dict:
@@ -2009,13 +2033,17 @@ class RegionOverrideTest(_StubbedServer):
         return json.loads(await _text(server.mcp.call_tool("set_region", args))), session
 
     async def test_a_region_name_is_still_written(self):
-        """The existing path must be untouched by the clear."""
-        result, session = await self._set(self._ROUTE, "europe-west4-drams3a")
+        """The existing path must be untouched by the clear — and still report
+        success when Railway does keep the value, so the read-back guard is a
+        check on reality rather than a blanket refusal."""
+        result, session = await self._set(
+            self._stored("europe-west4-drams3a"), "europe-west4-drams3a")
 
         self.assertEqual({"region": "europe-west4-drams3a"}, self._sent(session))
         self.assertEqual("europe-west4-drams3a", result["region"])
         self.assertFalse(result["cleared"])
         self.assertTrue(result["updated"])
+        self.assertTrue(result["verified"])
         self.assertIn("next deploy", result["note"])
 
     async def test_an_empty_region_clears_the_override(self):
@@ -2054,6 +2082,65 @@ class RegionOverrideTest(_StubbedServer):
         self.assertTrue(result["redeployed"])
         self.assertTrue([c for c in session.calls
                          if "serviceInstanceRedeploy" in c["query"]])
+
+    async def test_a_dropped_region_write_is_an_error_not_a_success(self):
+        """The defect this class is really guarding: Railway accepts the
+        region, answers true, stores nothing. `updated: true` on the strength
+        of that boolean is a lie, and it is the only signal the tool used to
+        have. _ROUTE keeps region null, which is exactly what the live API did
+        for every value tried on 2026-08-10."""
+        result, _ = await self._set(self._ROUTE, "us-west2")
+
+        self.assertNotIn("updated", result)
+        self.assertFalse(result["verified"])
+        self.assertEqual("us-west2", result["sent"])
+        self.assertIsNone(result["observed"])
+        # Both values have to be in the sentence: "it did not work" without
+        # them sends the next reader looking in the wrong layer.
+        self.assertIn("us-west2", result["error"])
+        self.assertIn("multiRegionConfig", result["error"])
+        self.assertIn("svc1", result["error"])
+        self.assertIn("e1", result["error"])
+
+    async def test_a_dropped_write_is_verified_before_any_redeploy(self):
+        """A deployment triggered to pick up a change that was never stored
+        restarts a service for nothing and moves the surprise later."""
+        result, session = await self._set(
+            {**self._ROUTE,
+             "serviceInstanceRedeploy": {"serviceInstanceRedeploy": True}},
+            "us-west2", redeploy=True)
+
+        self.assertFalse(result["verified"])
+        self.assertEqual([], [c for c in session.calls
+                              if "serviceInstanceRedeploy" in c["query"]])
+
+    async def test_the_check_reads_back_after_the_write_not_before(self):
+        """A verification satisfied by the guard read the tool already made
+        would pass while proving nothing, so the order is the guarantee."""
+        _, session = await self._set(self._ROUTE, "us-west2")
+
+        kinds = ["write" if "serviceInstanceUpdate" in c["query"] else "read"
+                 for c in session.calls]
+        self.assertEqual(["read", "write", "read"], kinds)
+
+    async def test_railway_refusing_the_check_is_not_reported_as_success(self):
+        """Third outcome, distinct from both: the write went out and then the
+        read-back failed, so whether it landed is unknown. Reporting that as
+        success is the original bug wearing a different hat."""
+        routes = {**self._ROUTE, "serviceInstance(serviceId": [
+            {"serviceInstance": {"serviceId": "svc1", "serviceName": "web",
+                                 "region": None}},
+            {"errors": [{"message": "Not Authorized"}]},
+        ]}
+        result, session = await self._set(routes, "us-west2")
+
+        self.assertNotIn("updated", result)
+        self.assertFalse(result["verified"])
+        self.assertIn("would not confirm", result["error"])
+        self.assertIn("Not Authorized", result["error"])
+        # The write really was attempted — this is not the pre-write guard.
+        self.assertEqual(1, len([c for c in session.calls
+                                 if "serviceInstanceUpdate" in c["query"]]))
 
 
 class BuildCommandTest(_StubbedServer):
@@ -2461,8 +2548,13 @@ class MissingServiceInstanceTest(_StubbedServer):
     async def test_an_existing_instance_is_still_written(self):
         """The guard must refuse the missing case only — the working path is
         the whole point of the tools."""
+        # `region` is here because set_region now reads the field back and
+        # refuses when it did not land — so "the working path" for that one
+        # tool means a Railway that stores what it is told, not merely one
+        # that has an instance. It matches the region _call writes.
         present = {**self._WRITE, "serviceInstance(serviceId": {
-            "serviceInstance": {"serviceId": "svc-pdf", "serviceName": "pdf"}}}
+            "serviceInstance": {"serviceId": "svc-pdf", "serviceName": "pdf",
+                                "region": "europe-west4-drams3a"}}}
 
         for tool in ("set_service_config", "set_start_command", "set_region",
                      "set_build_command", "set_dockerfile_path",
