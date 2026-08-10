@@ -256,6 +256,46 @@
       "service_id": "string"
     }
   },
+  "set_dockerfile_path": {
+    "required": [
+      "dockerfile_path",
+      "environment_id",
+      "service_id"
+    ],
+    "args": {
+      "dockerfile_path": "string",
+      "environment_id": "string",
+      "redeploy": "boolean",
+      "service_id": "string"
+    }
+  },
+  "set_healthcheck": {
+    "required": [
+      "environment_id",
+      "healthcheck_path",
+      "service_id"
+    ],
+    "args": {
+      "environment_id": "string",
+      "healthcheck_path": "string",
+      "healthcheck_timeout": "integer|null",
+      "redeploy": "boolean",
+      "service_id": "string"
+    }
+  },
+  "set_num_replicas": {
+    "required": [
+      "environment_id",
+      "num_replicas",
+      "service_id"
+    ],
+    "args": {
+      "environment_id": "string",
+      "num_replicas": "integer",
+      "redeploy": "boolean",
+      "service_id": "string"
+    }
+  },
   "set_region": {
     "required": [
       "environment_id",
@@ -266,6 +306,19 @@
       "environment_id": "string",
       "redeploy": "boolean",
       "region": "string",
+      "service_id": "string"
+    }
+  },
+  "set_root_directory": {
+    "required": [
+      "environment_id",
+      "root_directory",
+      "service_id"
+    ],
+    "args": {
+      "environment_id": "string",
+      "redeploy": "boolean",
+      "root_directory": "string",
       "service_id": "string"
     }
   },

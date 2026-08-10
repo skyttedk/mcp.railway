@@ -539,9 +539,12 @@ async def get_service_instance(environment_id: str, service_id: str) -> str:
     `region` is the per-service override; null means the service inherits
     Railway's default region (currently US West / us-west2 for new services —
     confirm with list_regions). Change it with set_region, and remove it again
-    with set_region and an empty region. `buildCommand` and `startCommand` have
-    their own setters too — set_build_command and set_start_command — each
-    clearing the override again on an empty string."""
+    with set_region and an empty region. Most of what this reports has a
+    standalone setter too — set_build_command, set_start_command,
+    set_dockerfile_path, set_root_directory, set_healthcheck, set_num_replicas
+    — each clearing a string override again on an empty string; the rest
+    (builder, watch patterns, pre-deploy command, restart policy, cron
+    schedule, sleep) is written with set_service_config."""
     data = await _query("""query($sid: String!, $eid: String!) {
       serviceInstance(serviceId: $sid, environmentId: $eid) {
         serviceId
@@ -750,6 +753,194 @@ async def set_build_command(environment_id: str, service_id: str, build_command:
     return json.dumps(result)
 
 
+@mcp.tool()
+async def set_dockerfile_path(environment_id: str, service_id: str,
+                              dockerfile_path: str, redeploy: bool = False) -> str:
+    """Set or clear the Dockerfile path for a service in one environment.
+
+    Use it to build from a Dockerfile that is not `./Dockerfile`, e.g.
+    "docker/Dockerfile.web". This is the same setting as the
+    `RAILWAY_DOCKERFILE_PATH` service variable; set it here rather than as a
+    variable, so it does not read as application config. NB: a Dockerfile is
+    selected by its presence or by this path — there is no DOCKERFILE builder
+    to choose.
+    Pass an empty string to clear the override, so Railway looks for
+    `./Dockerfile` again. The change only takes effect on the next deploy —
+    pass redeploy=true to trigger one immediately.
+
+    set_service_config carries dockerfile_path too, for changing it together
+    with other build settings in a single write; this tool is the standalone
+    one, and the two write the same field.
+
+    Refuses, and writes nothing, when the service has no instance in that
+    environment — Railway accepts the write silently in that case, so the
+    instance is confirmed first."""
+    refusal = await _instance_missing(environment_id, service_id, "set_dockerfile_path")
+    if refusal:
+        return refusal
+    data = await _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
+      serviceInstanceUpdate(serviceId: $sid, environmentId: $eid, input: $input)
+    }""", {"sid": service_id, "eid": environment_id,
+           "input": {"dockerfilePath": dockerfile_path or None}})
+    rejected = _update_rejected(data, environment_id, service_id)
+    if rejected:
+        return rejected
+    result: dict = {"serviceId": service_id, "environmentId": environment_id,
+                    "dockerfilePath": dockerfile_path or None, "updated": True,
+                    "redeployed": False}
+    if redeploy:
+        await _query("""mutation($sid: String!, $eid: String!) {
+          serviceInstanceRedeploy(serviceId: $sid, environmentId: $eid)
+        }""", {"sid": service_id, "eid": environment_id})
+        result["redeployed"] = True
+    else:
+        result["note"] = "Dockerfile-path change takes effect on the next deploy."
+    return json.dumps(result)
+
+
+@mcp.tool()
+async def set_root_directory(environment_id: str, service_id: str,
+                             root_directory: str, redeploy: bool = False) -> str:
+    """Set or clear the build root directory for a service in one environment.
+
+    The monorepo setting: point the service at a subdirectory of the repo, e.g.
+    "apps/api", and everything else (builder detection, Dockerfile lookup,
+    watch patterns) is resolved from there.
+    Pass an empty string to clear the override, so the service builds from the
+    repository root again. The change only takes effect on the next deploy —
+    pass redeploy=true to trigger one immediately.
+
+    set_service_config carries root_directory too, for changing it together
+    with other build settings in a single write; this tool is the standalone
+    one, and the two write the same field.
+
+    Refuses, and writes nothing, when the service has no instance in that
+    environment — Railway accepts the write silently in that case, so the
+    instance is confirmed first."""
+    refusal = await _instance_missing(environment_id, service_id, "set_root_directory")
+    if refusal:
+        return refusal
+    data = await _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
+      serviceInstanceUpdate(serviceId: $sid, environmentId: $eid, input: $input)
+    }""", {"sid": service_id, "eid": environment_id,
+           "input": {"rootDirectory": root_directory or None}})
+    rejected = _update_rejected(data, environment_id, service_id)
+    if rejected:
+        return rejected
+    result: dict = {"serviceId": service_id, "environmentId": environment_id,
+                    "rootDirectory": root_directory or None, "updated": True,
+                    "redeployed": False}
+    if redeploy:
+        await _query("""mutation($sid: String!, $eid: String!) {
+          serviceInstanceRedeploy(serviceId: $sid, environmentId: $eid)
+        }""", {"sid": service_id, "eid": environment_id})
+        result["redeployed"] = True
+    else:
+        result["note"] = "Root-directory change takes effect on the next deploy."
+    return json.dumps(result)
+
+
+@mcp.tool()
+async def set_healthcheck(environment_id: str, service_id: str,
+                          healthcheck_path: str,
+                          healthcheck_timeout: int | None = None,
+                          redeploy: bool = False) -> str:
+    """Set or clear the healthcheck for a service in one environment.
+
+    healthcheck_path is the path Railway polls before a new deployment takes
+    over traffic, e.g. "/healthz"; without one, a deployment goes live as soon
+    as the container starts. Pass an empty string to clear the healthcheck
+    again.
+    healthcheck_timeout is how many seconds Railway keeps trying before giving
+    up on the deployment. Omitting it leaves the stored timeout untouched — so
+    changing only the timeout means passing the CURRENT path alongside it (read
+    it with get_service_instance), and clearing the path leaves the timeout
+    where it is, harmlessly, since nothing polls.
+    The change only takes effect on the next deploy — pass redeploy=true to
+    trigger one immediately.
+
+    set_service_config carries healthcheck_path and healthcheck_timeout too,
+    for changing them together with other deploy settings in a single write;
+    this tool is the standalone one, and the two write the same fields.
+
+    Refuses, and writes nothing, when the service has no instance in that
+    environment — Railway accepts the write silently in that case, so the
+    instance is confirmed first."""
+    refusal = await _instance_missing(environment_id, service_id, "set_healthcheck")
+    if refusal:
+        return refusal
+    # "" clears the path as an explicit null; the timeout is only sent when the
+    # caller passed one, because an omitted key means "untouched" here — the
+    # same split set_service_config makes between None and "".
+    payload: dict = {"healthcheckPath": healthcheck_path or None}
+    if healthcheck_timeout is not None:
+        payload["healthcheckTimeout"] = healthcheck_timeout
+    data = await _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
+      serviceInstanceUpdate(serviceId: $sid, environmentId: $eid, input: $input)
+    }""", {"sid": service_id, "eid": environment_id, "input": payload})
+    rejected = _update_rejected(data, environment_id, service_id)
+    if rejected:
+        return rejected
+    result: dict = {"serviceId": service_id, "environmentId": environment_id,
+                    "healthcheckPath": healthcheck_path or None, "updated": True,
+                    "redeployed": False}
+    if healthcheck_timeout is not None:
+        result["healthcheckTimeout"] = healthcheck_timeout
+    if redeploy:
+        await _query("""mutation($sid: String!, $eid: String!) {
+          serviceInstanceRedeploy(serviceId: $sid, environmentId: $eid)
+        }""", {"sid": service_id, "eid": environment_id})
+        result["redeployed"] = True
+    else:
+        result["note"] = "Healthcheck change takes effect on the next deploy."
+    return json.dumps(result)
+
+
+@mcp.tool()
+async def set_num_replicas(environment_id: str, service_id: str,
+                           num_replicas: int, redeploy: bool = False) -> str:
+    """Set how many replicas of a service run in one environment.
+
+    Horizontal scaling: Railway runs this many identical containers of the
+    service behind its load balancer. Read the current count back as
+    `numReplicas` from get_service_instance.
+    Unlike the string settings there is no "clear" — a replica count is always
+    a number, and 1 is Railway's default. The change only takes effect on the
+    next deploy — pass redeploy=true to trigger one immediately.
+
+    set_service_config carries num_replicas too, for changing it together with
+    other deploy settings in a single write; this tool is the standalone one,
+    and the two write the same field.
+
+    Refuses, and writes nothing, when the service has no instance in that
+    environment — Railway accepts the write silently in that case, so the
+    instance is confirmed first."""
+    refusal = await _instance_missing(environment_id, service_id, "set_num_replicas")
+    if refusal:
+        return refusal
+    # Sent as-is, never through the `or None` the string setters use: 0 is a
+    # value Railway can be given, and `0 or None` would silently turn it into
+    # "leave the replica count alone".
+    data = await _query("""mutation($sid: String!, $eid: String!, $input: ServiceInstanceUpdateInput!) {
+      serviceInstanceUpdate(serviceId: $sid, environmentId: $eid, input: $input)
+    }""", {"sid": service_id, "eid": environment_id,
+           "input": {"numReplicas": num_replicas}})
+    rejected = _update_rejected(data, environment_id, service_id)
+    if rejected:
+        return rejected
+    result: dict = {"serviceId": service_id, "environmentId": environment_id,
+                    "numReplicas": num_replicas, "updated": True,
+                    "redeployed": False}
+    if redeploy:
+        await _query("""mutation($sid: String!, $eid: String!) {
+          serviceInstanceRedeploy(serviceId: $sid, environmentId: $eid)
+        }""", {"sid": service_id, "eid": environment_id})
+        result["redeployed"] = True
+    else:
+        result["note"] = "Replica-count change takes effect on the next deploy."
+    return json.dumps(result)
+
+
 # Railway's own enums. Sent as GraphQL enum values, so a typo is rejected by
 # the API with a parse error that names neither the tool nor the argument —
 # checking here turns that into a message the caller can act on.
@@ -774,11 +965,16 @@ async def set_service_config(environment_id: str, service_id: str,
                              cron_schedule: str | None = None,
                              sleep_application: bool | None = None,
                              redeploy: bool = False) -> str:
-    """Set build and deploy settings for a service in one environment — the
-    dashboard's Settings tab, minus what already has its own tool
-    (set_region, set_start_command, set_variables). build_command is the one
-    overlap: set_build_command changes it on its own, this changes it together
-    with the other build settings in a single write.
+    """Set several build and deploy settings for a service in one write —
+    builder, Dockerfile path, root directory, build/pre-deploy commands, watch
+    patterns, railway config file, healthcheck, replicas, restart policy, cron
+    schedule and sleep — each also readable with get_service_instance; the
+    commonly-changed ones have standalone tools (set_build_command,
+    set_dockerfile_path, set_root_directory, set_healthcheck,
+    set_num_replicas, set_start_command, set_region, set_variables) that write
+    the same fields. This is the dashboard's Settings tab in one call; reach
+    for it when several settings change together, or for the ones with no tool
+    of their own.
 
     Every setting is optional and **omitting one leaves it untouched**; only
     the arguments actually passed are sent to Railway. For the string

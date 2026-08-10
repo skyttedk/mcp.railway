@@ -2150,6 +2150,205 @@ class BuildCommandTest(_StubbedServer):
         self.assertIn("svc1", result["error"])
 
 
+class SplitOutSetterTest(_StubbedServer):
+    """The four settings lifted out of set_service_config into tools of their
+    own (2026-08-10).
+
+    Dockerfile path, root directory, healthcheck and replica count are among
+    the most-changed Railway settings and were reachable only through
+    set_service_config — one tool, fifteen optional arguments, a name that
+    says nothing about any of them. An agent reading the tool list concluded
+    the API could not do it and handed the job back, exactly as it had for the
+    build command before set_build_command. These four are that fix, and they
+    are deliberately identical to set_build_command: the value is written with
+    a single-key serviceInstanceUpdate, `""` clears a string override as an
+    explicit null (an omitted key means "untouched" to
+    ServiceInstanceUpdateInput), the redeploy is opt-in, and a missing service
+    instance is refused rather than reported as written.
+
+    Written as a table because the sameness IS the property: a divergence in
+    one of the four is the bug worth catching, and a table makes it impossible
+    to cover three of them and quietly forget the fourth.
+    """
+
+    # tool -> (arguments it takes, the input payload that must reach Railway)
+    _SETTERS = {
+        "set_dockerfile_path": ({"dockerfile_path": "docker/Dockerfile.web"},
+                                {"dockerfilePath": "docker/Dockerfile.web"}),
+        "set_root_directory": ({"root_directory": "apps/api"},
+                               {"rootDirectory": "apps/api"}),
+        "set_healthcheck": ({"healthcheck_path": "/healthz"},
+                            {"healthcheckPath": "/healthz"}),
+        "set_num_replicas": ({"num_replicas": 3}, {"numReplicas": 3}),
+    }
+    # The three string settings, and the argument whose "" clears them.
+    _CLEARABLE = {"set_dockerfile_path": ("dockerfile_path", "dockerfilePath"),
+                  "set_root_directory": ("root_directory", "rootDirectory"),
+                  "set_healthcheck": ("healthcheck_path", "healthcheckPath")}
+
+    _ROUTE = {"serviceInstanceUpdate": {"serviceInstanceUpdate": True},
+              "serviceInstance(serviceId": {
+                  "serviceInstance": {"serviceId": "svc1", "serviceName": "web"}}}
+
+    @staticmethod
+    def _sent(session: _FakeSession) -> dict:
+        writes = [c for c in session.calls if "serviceInstanceUpdate" in c["query"]]
+        assert len(writes) == 1, f"expected one write, got {len(writes)}"
+        return writes[0]["variables"]["input"]
+
+    async def _set(self, tool: str, routes: dict, args: dict,
+                   **extra) -> tuple[dict, _FakeSession]:
+        session = self.install(routes)
+        call = {"environment_id": "e1", "service_id": "svc1", **args, **extra}
+        return json.loads(await _text(server.mcp.call_tool(tool, call))), session
+
+    async def test_each_setter_writes_only_its_own_field(self):
+        for tool, (args, expected) in self._SETTERS.items():
+            with self.subTest(tool=tool):
+                _, session = await self._set(tool, self._ROUTE, args)
+
+                self.assertEqual(expected, self._sent(session),
+                                 "the write must touch that one field and no other "
+                                 "— these tools exist so a caller can change one "
+                                 "setting without reading the rest back first")
+
+    async def test_each_setter_echoes_the_value_and_names_the_next_deploy(self):
+        for tool, (args, expected) in self._SETTERS.items():
+            with self.subTest(tool=tool):
+                field, value = next(iter(expected.items()))
+                result, _ = await self._set(tool, self._ROUTE, args)
+
+                self.assertEqual(value, result[field])
+                self.assertTrue(result["updated"])
+                self.assertFalse(result["redeployed"])
+                self.assertIn("next deploy", result["note"])
+
+    async def test_an_empty_string_clears_a_string_setting(self):
+        """The key must be present and null, exactly as set_build_command and
+        set_region send their clear — dropping it leaves Railway's stored
+        override in place, which reads back as a change that never happened."""
+        for tool, (arg, field) in self._CLEARABLE.items():
+            with self.subTest(tool=tool):
+                result, session = await self._set(tool, self._ROUTE, {arg: ""})
+
+                sent = self._sent(session)
+                self.assertIn(field, sent,
+                              "the key was dropped, so the override was left in place")
+                self.assertIsNone(sent[field])
+                self.assertIsNone(result[field])
+                self.assertTrue(result["updated"])
+
+    async def test_a_replica_count_of_zero_is_still_a_write(self):
+        """set_num_replicas must not borrow the string setters' `or None`: 0 is
+        a number Railway can be given, and `0 or None` would silently turn a
+        scale-to-zero into "leave the replica count alone" while still
+        reporting `updated: true`. The same falsey trap set_service_config
+        already documents."""
+        result, session = await self._set("set_num_replicas", self._ROUTE,
+                                          {"num_replicas": 0})
+
+        self.assertEqual({"numReplicas": 0}, self._sent(session))
+        self.assertEqual(0, result["numReplicas"])
+        self.assertTrue(result["updated"])
+
+    async def test_redeploy_is_opt_in(self):
+        loud_routes = {**self._ROUTE,
+                       "serviceInstanceRedeploy": {"serviceInstanceRedeploy": True}}
+
+        for tool, (args, _expected) in self._SETTERS.items():
+            with self.subTest(tool=tool):
+                quiet, session = await self._set(tool, self._ROUTE, args)
+                self.assertFalse(quiet["redeployed"])
+                self.assertEqual([], [c for c in session.calls
+                                      if "serviceInstanceRedeploy" in c["query"]])
+
+                loud, session = await self._set(tool, loud_routes, args,
+                                                redeploy=True)
+                self.assertTrue(loud["redeployed"])
+                self.assertTrue([c for c in session.calls
+                                 if "serviceInstanceRedeploy" in c["query"]])
+
+    async def test_it_refuses_a_service_with_no_instance(self):
+        """Same serviceInstanceUpdate, same silent acceptance for an absent
+        instance, so the same guard — including on the clear."""
+        absent = {**self._ROUTE, "serviceInstance(serviceId": {"serviceInstance": None}}
+
+        for tool, (args, _expected) in self._SETTERS.items():
+            variants = [args]
+            if tool in self._CLEARABLE:
+                variants.append({self._CLEARABLE[tool][0]: ""})
+            for variant in variants:
+                with self.subTest(tool=tool, args=variant):
+                    result, session = await self._set(tool, absent, variant)
+
+                    self.assertNotIn("updated", result)
+                    self.assertIn("svc1", result["error"])
+                    self.assertIn("e1", result["error"])
+                    self.assertEqual([], [c for c in session.calls
+                                          if "serviceInstanceUpdate" in c["query"]])
+
+    async def test_a_rejected_mutation_is_not_reported_as_updated(self):
+        rejected = {**self._ROUTE,
+                    "serviceInstanceUpdate": {"serviceInstanceUpdate": False}}
+
+        for tool, (args, _expected) in self._SETTERS.items():
+            with self.subTest(tool=tool):
+                result, _ = await self._set(tool, rejected, args)
+
+                self.assertNotIn("updated", result)
+                self.assertIn("svc1", result["error"])
+
+
+class HealthcheckTimeoutTest(_StubbedServer):
+    """set_healthcheck writes two fields, and only one of them is required.
+
+    healthcheckTimeout has no "clear" and no natural default to send, so the
+    same rule set_service_config uses applies inside a single tool: an omitted
+    timeout must not appear in the payload at all, because a key that IS there
+    is written — sending a null would wipe a timeout the caller never
+    mentioned while it looked like a plain path change.
+    """
+
+    _ROUTE = {"serviceInstanceUpdate": {"serviceInstanceUpdate": True},
+              "serviceInstance(serviceId": {
+                  "serviceInstance": {"serviceId": "svc1", "serviceName": "web"}}}
+
+    async def _set(self, **args) -> tuple[dict, dict]:
+        session = self.install(self._ROUTE)
+        call = {"environment_id": "e1", "service_id": "svc1", **args}
+        result = json.loads(await _text(server.mcp.call_tool("set_healthcheck", call)))
+        sent = [c for c in session.calls
+                if "serviceInstanceUpdate" in c["query"]][0]["variables"]["input"]
+        return result, sent
+
+    async def test_an_omitted_timeout_is_left_untouched(self):
+        result, sent = await self._set(healthcheck_path="/healthz")
+
+        self.assertEqual({"healthcheckPath": "/healthz"}, sent,
+                         "an omitted timeout must not be sent — the stored one "
+                         "would be overwritten by a call that never mentioned it")
+        self.assertNotIn("healthcheckTimeout", result)
+
+    async def test_a_given_timeout_is_sent_and_echoed(self):
+        result, sent = await self._set(healthcheck_path="/healthz",
+                                       healthcheck_timeout=120)
+
+        self.assertEqual({"healthcheckPath": "/healthz", "healthcheckTimeout": 120},
+                         sent)
+        self.assertEqual(120, result["healthcheckTimeout"])
+
+    async def test_clearing_the_path_does_not_touch_the_timeout(self):
+        """Clearing is about the path only. Nothing polls once the path is
+        gone, so the stored timeout is harmless — and inventing a write for it
+        would destroy the value a caller wants back when they restore the
+        path."""
+        result, sent = await self._set(healthcheck_path="")
+
+        self.assertEqual({"healthcheckPath": None}, sent)
+        self.assertIsNone(result["healthcheckPath"])
+        self.assertTrue(result["updated"])
+
+
 class MissingServiceInstanceTest(_StubbedServer):
     """Regression: config writes reported success for an instance that was not
     there.
@@ -2179,6 +2378,10 @@ class MissingServiceInstanceTest(_StubbedServer):
         args = {"environment_id": "env-prod", "service_id": "svc-pdf"}
         args.update({"set_start_command": {"start_command": "node serve.js"},
                      "set_build_command": {"build_command": "npm run build"},
+                     "set_dockerfile_path": {"dockerfile_path": "docker/Dockerfile"},
+                     "set_root_directory": {"root_directory": "apps/api"},
+                     "set_healthcheck": {"healthcheck_path": "/healthz"},
+                     "set_num_replicas": {"num_replicas": 3},
                      "set_service_config": {"num_replicas": 2},
                      "set_region": {"region": "europe-west4-drams3a"}}[tool])
         return json.loads(await _text(server.mcp.call_tool(tool, args))), session
@@ -2214,6 +2417,20 @@ class MissingServiceInstanceTest(_StubbedServer):
         self.assertIn("env-prod", result["error"])
         self.assertEqual([], self._writes(session))
 
+    async def test_the_split_out_setters_refuse_a_service_with_no_instance(self):
+        """The four settings split out of set_service_config (2026-08-10) write
+        through the same mutation, so they inherit the same defect if the guard
+        is left out — and they were written with it, not fitted afterwards."""
+        for tool in ("set_dockerfile_path", "set_root_directory",
+                     "set_healthcheck", "set_num_replicas"):
+            with self.subTest(tool=tool):
+                result, session = await self._call(tool, self._ABSENT)
+
+                self.assertNotIn("updated", result)
+                self.assertIn("svc-pdf", result["error"])
+                self.assertIn("env-prod", result["error"])
+                self.assertEqual([], self._writes(session))
+
     async def test_set_region_refuses_a_service_with_no_instance(self):
         """set_region writes through the same serviceInstanceUpdate mutation and
         had the same defect: a region change reported as applied while nothing
@@ -2232,7 +2449,8 @@ class MissingServiceInstanceTest(_StubbedServer):
         """Railway answers this state with a GraphQL error rather than a null,
         depending on how the pair is wrong. Both mean the same thing here."""
         for tool in ("set_service_config", "set_start_command", "set_region",
-                     "set_build_command"):
+                     "set_build_command", "set_dockerfile_path",
+                     "set_root_directory", "set_healthcheck", "set_num_replicas"):
             with self.subTest(tool=tool):
                 result, session = await self._call(tool, self._NOT_FOUND)
 
@@ -2247,7 +2465,8 @@ class MissingServiceInstanceTest(_StubbedServer):
             "serviceInstance": {"serviceId": "svc-pdf", "serviceName": "pdf"}}}
 
         for tool in ("set_service_config", "set_start_command", "set_region",
-                     "set_build_command"):
+                     "set_build_command", "set_dockerfile_path",
+                     "set_root_directory", "set_healthcheck", "set_num_replicas"):
             with self.subTest(tool=tool):
                 result, session = await self._call(tool, present)
 

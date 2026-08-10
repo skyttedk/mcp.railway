@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 An MCP server for Railway hosting, talking straight to Railway's GraphQL API
 (`https://backboard.railway.com/graphql/v2`) — no Railway CLI involved. It covers
 projects, services, environments, variables, deployments, logs, metrics, domains
-and volumes: 33 tools, all of them in one file, `server.py`.
+and volumes: 37 tools, all of them in one file, `server.py`.
 Repo: `skyttedk/mcp.railway`.
 
 It runs two ways from that same file. `MCP_TRANSPORT` unset (or anything other
@@ -84,7 +84,7 @@ on purpose. Confirm the change is wanted, then regenerate and commit the snapsho
 alongside it:
 
 ```powershell
-.\.venv\Scripts\python.exe tests\test_server.py --refresh   # "wrote 33 tools to …"
+.\.venv\Scripts\python.exe tests\test_server.py --refresh   # "wrote 37 tools to …"
 ```
 
 ## Deploy
@@ -136,7 +136,7 @@ cheapest liveness check.
   2026-08-06); until it is, pass `project_id` explicitly to that namespace.
 - **A tool's failure is explained at the boundary, not in the tool.** Everything
   raised out of `_query_sync` is a `RailwayCallError` whose `str()` is already
-  the finished sentence `_why` produces — so all 33 tools report a refused
+  the finished sentence `_why` produces — so all 37 tools report a refused
   token, an unreachable Railway, a 5xx, a non-JSON edge page and a GraphQL
   refusal in the same words, and the next improvement to `_why` reaches all of
   them at once. Until 2026-08-07 only the GraphQL branch was dressed up and only
@@ -260,13 +260,28 @@ cheapest liveness check.
   its presence or by `dockerfilePath`, never by choosing a builder.
   `ServiceConfigTest` refuses the `DOCKERFILE` guess with a message naming
   `dockerfile_path`, because that is the wrong turn an agent actually takes.
-  **`build_command` is deliberately written by two tools**: `set_service_config`
-  (together with other build settings, one write) and `set_build_command`
-  (on its own, the sibling of `set_start_command`, added 2026-08-09 because the
-  build command was readable in `get_service_instance` and had no setter an
-  agent could find). Both send the same `buildCommand` field — do not "de-
-  duplicate" it out of `set_service_config`, which would change that tool's
-  published arguments for both namespaces.
+  **Five settings are deliberately written by two tools each** —
+  `build_command`, `dockerfile_path`, `root_directory`, the healthcheck pair
+  (`healthcheck_path` + `healthcheck_timeout`) and `num_replicas`. Each has a
+  standalone setter (`set_build_command` 2026-08-09, then
+  `set_dockerfile_path`, `set_root_directory`, `set_healthcheck`,
+  `set_num_replicas` 2026-08-10) *and* an argument on `set_service_config`,
+  which changes it together with the other settings in a single write. They
+  were split out because a setting reachable only through a fifteen-argument
+  tool named after nothing in particular is undiscoverable: agents read the
+  tool list, concluded the API could not change a Dockerfile path or a replica
+  count, and handed the job back as dashboard work. The overlapping pairs send
+  the identical `ServiceInstanceUpdateInput` field — **do not "de-duplicate"
+  any of them out of `set_service_config`**, which would change that tool's
+  published arguments for both namespaces. What is left in
+  `set_service_config` alone is the rare or meaningless-alone half: `builder`,
+  `watch_patterns`, `railway_config_file`, `pre_deploy_command`,
+  `restart_policy_*`, `cron_schedule`, `sleep_application`.
+  One asymmetry to keep: the string setters clear on `""` (sent as an explicit
+  null), while `set_num_replicas` sends its int straight through — `0 or None`
+  would turn a scale-to-zero into "leave it alone" and still report success —
+  and `set_healthcheck` sends `healthcheck_timeout` only when it is passed, so
+  a plain path change never wipes the stored timeout.
 - **In `set_service_config`, an omitted setting and a cleared one must stay
   different things.** It sends a partial `ServiceInstanceUpdateInput`, and every
   key present in that payload is written — so a truthiness filter over the
@@ -283,18 +298,20 @@ cheapest liveness check.
   Railway raises nothing for that: `set_service_config` answered `updated: true`
   with a full `applied` block, and `set_start_command` and `set_region` the
   same, while the settings were written nowhere; the next deploy then refused
-  with "Service Instance not found". All three now run `_instance_missing`
-  first — the same
+  with "Service Instance not found". Every setter on this mutation now runs
+  `_instance_missing` first — the same
   `serviceInstance` query `get_service_instance` uses — and refuse, naming both
   ids, when it comes back null OR when Railway will not confirm it (its own
   answer for this state is sometimes the GraphQL error "ServiceInstance not
   found", sometimes a bare "Not Authorized" that hides whether the thing exists
   at all). The mutation's Boolean result, previously discarded, is now checked
   for an explicit `false` only, so a null or absent value behaves as before.
-  `MissingServiceInstanceTest` pins it for all four setters. Any future tool
-  reaching for `serviceInstanceUpdate` needs the same two lines — `set_region`
-  was left out of the first pass and shipped the defect for a day;
-  `set_build_command` (2026-08-09) was written with them from the start.
+  `MissingServiceInstanceTest` pins it for all eight setters on this mutation.
+  Any future tool reaching for `serviceInstanceUpdate` needs the same two lines
+  — `set_region` was left out of the first pass and shipped the defect for a
+  day; `set_build_command` (2026-08-09) and the four split out on 2026-08-10
+  (`set_dockerfile_path`, `set_root_directory`, `set_healthcheck`,
+  `set_num_replicas`) were written with them from the start.
 - **`deploy` and `create_deployment` are not the same operation, and the
   confusion is silent.** `deploy` restarts the container already running and
   builds nothing, so an agent reaching for it sees a success and reports that new
