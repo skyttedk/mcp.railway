@@ -1299,6 +1299,12 @@ _CONTAINER_PROBE_WINDOW_SECONDS = 1800
 # this age the probe declines to answer instead.
 _CONTAINER_PROBE_MIN_AGE_SECONDS = 600
 
+# Only measurements a CONTAINER produces belong here. CPU and memory stop dead
+# when the process is gone, which is the whole basis of the probe; DISK_USAGE_GB
+# and BACKUP_USAGE_GB describe the volume and keep reporting the same non-zero
+# number with no container anywhere (and come back tagged deploymentId: null —
+# see the note above get_metrics). Adding either would turn a stored byte into
+# "resource-use-seen" and silence the accusation this probe exists to make.
 _CONTAINER_PROBE_MEASUREMENTS = ("CPU_USAGE", "MEMORY_USAGE_GB")
 
 
@@ -1346,6 +1352,13 @@ async def _container_probe(project_id: str, environment_id: str, service_id: str
         return {"verdict": "not-checked",
                 "reason": f"Railway would not answer the metrics query: {exc}"}
 
+    # Aggregated across every returned series on purpose, never attributed to a
+    # deployment: `groupBy: [DEPLOYMENT_ID]` splits the answer per deployment AND
+    # can add a series tagged deploymentId: null (see the note above get_metrics),
+    # so picking "the running deployment's series" is a guess. The question here
+    # is only "did ANY container burn CPU or memory in this window", which the
+    # union answers correctly whatever the tags say — hence `tags` is not even
+    # selected in the query above.
     maxima: dict[str, float] = {}
     samples = 0
     for one in data.get("metrics") or []:
@@ -1709,6 +1722,30 @@ def _condense_metrics(series: list[dict], window_seconds: float) -> list[dict]:
     return condensed
 
 
+# ── a metrics series is not always a deployment's ────────────────────
+#
+# `groupBy: [DEPLOYMENT_ID]` reads as "one series per deployment", and for
+# CPU_USAGE / MEMORY_USAGE_GB it is: each series carries the id of the
+# deployment that produced it. But not every measurement Railway exposes is
+# produced by a deployment, and those come back in the SAME list with
+# `tags: {deploymentId: null}` — an extra, unattributed series alongside the
+# real ones. Observed 2026-08-10 on the mcp.google service: one MEMORY_USAGE_GB
+# series tagged with the running deployment's id, and one DISK_USAGE_GB series
+# tagged null, in a single answer. The volume is service-scoped and outlives
+# every deployment, so there is no id to attribute it to; the null is Railway
+# being accurate, not Railway losing the tag.
+#
+# The consequence for anything reading this data: DO NOT ATTRIBUTE BY DEFAULT.
+# Filtering to one deploymentId silently drops the untagged series, and treating
+# the untagged series as "the deployment's" credits a volume's stored bytes to a
+# process. Aggregate across all series unless a question genuinely needs one
+# deployment's window — and when it does, filter on a deploymentId you already
+# know rather than assuming the tag is populated, and expect the untagged series
+# to be unusable for that question at all. `_container_probe` above is the
+# working example: it unions every series and never looks at the tags.
+#
+# Railway has not documented the null tag; if a later API version starts
+# attributing volume metrics, this note is what to re-check, not silently trust.
 @mcp.tool()
 async def get_metrics(project_id: str, environment_id: str, service_id: str,
                 start_date: str, end_date: str = "",
@@ -1720,10 +1757,18 @@ async def get_metrics(project_id: str, environment_id: str, service_id: str,
     end_date defaults to now. measurements is a subset of: CPU_USAGE, CPU_USAGE_2,
     CPU_LIMIT, MEMORY_USAGE_GB, MEMORY_LIMIT_GB, NETWORK_TX_GB, NETWORK_RX_GB,
     DISK_USAGE_GB, EPHEMERAL_DISK_USAGE_GB, BACKUP_USAGE_GB — defaults to
-    CPU_USAGE and MEMORY_USAGE_GB if omitted. Results are grouped by deployment,
-    so each sample series carries its deploymentId tag — use that to isolate one
-    deployment's window when others ran in the same project/environment/service
-    during the requested range. Each value is {ts, value} (ts = unix seconds).
+    CPU_USAGE and MEMORY_USAGE_GB if omitted. Each value is {ts, value}
+    (ts = unix seconds).
+
+    RESULTS ARE GROUPED BY DEPLOYMENT, BUT NOT EVERY SERIES HAS A DEPLOYMENT.
+    CPU and memory series carry the deploymentId that produced them, so those
+    can be isolated per deployment when several ran during the range. Volume-
+    scoped measurements (DISK_USAGE_GB, BACKUP_USAGE_GB) belong to no deployment
+    and arrive in the same list tagged `deploymentId: null`. So AGGREGATE ACROSS
+    SERIES BY DEFAULT: filtering to one deploymentId quietly drops the untagged
+    series, and reading the untagged series as a deployment's own usage credits a
+    volume's stored bytes to a process. Attribute only when the question really
+    is per-deployment, and then match on an id you already know.
 
     A wide range comes back SUMMARISED, never truncated. The sampling interval
     is chosen from the length of the range (about an hour keeps Railway's own
