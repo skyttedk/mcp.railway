@@ -261,6 +261,30 @@ consumed one entry per matching call, with the last entry repeating. Reach for
 it only when a test genuinely needs two answers to one query; a single payload
 is clearer everywhere else.
 
+## `BuildCommandTest` / `HealthcheckClearTest` — the clear Railway swallows
+
+The same read-back, a different Railway behaviour. `region` is dropped whatever
+is sent; `buildCommand` and `healthcheckPath` keep a value and drop the explicit
+null, so it is *clearing* that reported a success nobody had checked — confirmed
+live 2026-08-10 on both, in the session where a `set_num_replicas` through the
+identical mutation landed. Both tools now call `_write_unconfirmed` on every
+write, and the two classes pin the four outcomes each: a value that lands, a
+clear that lands (a service with no override to remove — the check is on the end
+state, so that is honestly a success and not an accusation), the clear Railway
+swallowed, which is an error naming both the null sent and the value still
+stored, and a read-back that itself fails, which is neither. The read-write-read
+order is pinned for the same reason as `set_region`'s: a check placed before the
+write would be satisfied by the guard read the tool already makes and prove
+nothing. `HealthcheckClearTest` carries one extra, since `set_healthcheck` writes
+a second field the check does not cover — a timeout riding along with a swallowed
+clear is named in the refusal rather than being left under "Nothing was changed",
+and a caller who sent no timeout does not get the caveat.
+
+The routes in `SplitOutSetterTest`, `HealthcheckTimeoutTest` and
+`MissingServiceInstanceTest` gained the echoed field for this: a stub that
+answers the verify read with a bare instance is now a Railway that dropped the
+write, so a happy-path test has to say what it stored.
+
 ## `RegionMetroGroupingTest` — thirteen names, five places
 
 `list_regions` returned Railway's flat array, in which the shared metro code

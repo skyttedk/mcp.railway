@@ -71,8 +71,8 @@ py -3.12 -m venv .venv
 The suite is stdlib `unittest`, so there is no test framework to install, but it
 imports `server.py` and therefore needs `requirements.txt` installed. It needs no
 Railway credentials and never contacts the Railway API: it swaps `server._session`
-for a fake at the HTTP boundary and refuses any call that forgets to. **165 tests,
-1.0 s, verified 2026-08-13** on Python 3.12.10. `tests/README.md` explains what
+for a fake at the HTTP boundary and refuses any call that forgets to. **175 tests,
+1.4 s, verified 2026-08-13** on Python 3.12.10. `tests/README.md` explains what
 each class is protecting and why.
 
 GitHub Actions runs the same command on every push and pull request
@@ -367,10 +367,27 @@ cheapest liveness check.
   independent code paths and wondered whether its own argument serialization
   was at fault — it was not, this reproduces cleanly. So there are two distinct
   Railway behaviours, not one: nulls dropped on clearable string fields, and
-  `region` dropped even when non-null. `_write_unconfirmed` is written
-  generically for exactly this reason and is deliberately **not** yet wired
-  into the other setters — that is its own card, and until it is done every
-  `""` clear on this input still reports a success it has not checked.
+  `region` dropped even when non-null. `_write_unconfirmed` was written
+  generically for exactly this reason and **is now wired into both**
+  (2026-08-13): `set_build_command` and `set_healthcheck` read their field back
+  after every write — not only the clear, since a value echoed back unread is a
+  guess whichever value it is — and a clear Railway swallowed comes back as an
+  error naming what was sent and what is still stored, with the redeploy
+  skipped. `BuildCommandTest` and `HealthcheckClearTest` pin the four outcomes
+  each: a value that lands, a clear that lands (a service with nothing to
+  remove — the check is on the end state, so that is honestly a success), the
+  dropped clear, and a read-back that itself fails. Two things this does NOT
+  cover, both deliberate. **`set_healthcheck`'s timeout is not read back** — it
+  has no clear and no evidence of being dropped, so `healthcheckTimeout` in the
+  answer is still only what was sent; when a timeout rides along with a clear
+  that was swallowed, the refusal says so rather than letting "Nothing was
+  changed" stand for a field nobody checked. And **`set_start_command`,
+  `set_dockerfile_path` and `set_root_directory` are still unverified**: they
+  are string setters on the same input and very probably share the defect, but
+  no one has reproduced it on them, and the fleet's habit is to write down what
+  was seen rather than what was assumed. Their `""` clear still reports a
+  success it has not checked — that is the next card, not a gap to paper over
+  by guessing here.
 - **`serviceInstanceUpdate` does not object to a service instance that is not
   there, so every setter has to look first.** Config belongs to the service
   *instance* — one per environment — not to the service, so a service can exist
