@@ -71,7 +71,7 @@ py -3.12 -m venv .venv
 The suite is stdlib `unittest`, so there is no test framework to install, but it
 imports `server.py` and therefore needs `requirements.txt` installed. It needs no
 Railway credentials and never contacts the Railway API: it swaps `server._session`
-for a fake at the HTTP boundary and refuses any call that forgets to. **185 tests,
+for a fake at the HTTP boundary and refuses any call that forgets to. **186 tests,
 1.4 s, verified 2026-08-13** on Python 3.12.10. `tests/README.md` explains what
 each class is protecting and why.
 
