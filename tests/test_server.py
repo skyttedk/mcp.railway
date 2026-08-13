@@ -940,6 +940,272 @@ class DeleteServiceTest(_StubbedServer):
         self.assertEqual([], session.calls)
 
 
+class EnvironmentLifecycleTest(_StubbedServer):
+    """Deleting an environment is the second irreversible operation here, and it
+    destroys more than serviceDelete does: every service instance in it, their
+    variables, their deployments and their volumes' data.
+
+    It exists to be driven by an ephemeral-preview script — a loop that creates
+    and destroys environments with no human between the request and the
+    mutation — so the property under test is that the loop can only ever reach
+    the environments it made. A name that carries a throwaway prefix goes; a
+    long-lived one needs the intent spelled out; `production`, `test` and the
+    project's own default environment are refused whatever is passed, because a
+    flag that can unlock them is a flag a retry will eventually pass. Every
+    refusal must leave the account untouched and name the environment, and
+    update_deployment_trigger must refuse rather than guess when the service it
+    is given has no single trigger to rewrite.
+    """
+
+    _PROJECT = {"project(id:": {"project": {"id": "p1", "name": "riskwave-app",
+                                            "baseEnvironmentId": "env-prod",
+                                            "primaryEnvironmentId": "env-prod"}}}
+    _DELETE = {"environmentDelete": {"environmentDelete": True}}
+
+    @staticmethod
+    def _env(name: str, ephemeral: bool = False, env_id: str = "env-1") -> dict:
+        return {"environment(id:": {"environment": {
+            "id": env_id, "name": name, "projectId": "p1",
+            "isEphemeral": ephemeral}}}
+
+    @staticmethod
+    def _deletions(session: _FakeSession) -> list[dict]:
+        return [c for c in session.calls if "environmentDelete" in c["query"]]
+
+    async def _delete(self, routes: dict, args: dict) -> tuple[dict, _FakeSession]:
+        session = self.install(routes)
+        result = json.loads(await _text(server.mcp.call_tool("delete_environment", args)))
+        return result, session
+
+    # ── create ──────────────────────────────────────────────────────
+
+    async def test_creating_from_a_source_environment_asks_railway_to_clone(self):
+        """The whole point of the create half: sourceEnvironmentId must reach
+        Railway, or every "clone" silently produces an empty environment."""
+        session = self.install({"environmentCreate": {"environmentCreate": {
+            "id": "env-new", "name": "pr-42", "projectId": "p1",
+            "isEphemeral": True, "createdAt": "2026-08-13T10:00:00Z"}}})
+        result = json.loads(await _text(server.mcp.call_tool(
+            "create_environment", {"name": "pr-42", "project_id": "p1",
+                                   "source_environment_id": "env-test",
+                                   "ephemeral": True})))
+
+        sent = session.calls[0]["variables"]["input"]
+        self.assertEqual("env-test", sent["sourceEnvironmentId"])
+        self.assertEqual({"projectId": "p1", "name": "pr-42",
+                          "sourceEnvironmentId": "env-test", "ephemeral": True},
+                         sent)
+        self.assertEqual("env-new", result["id"])
+        self.assertEqual("env-test", result["clonedFrom"])
+        self.assertIn("background", result["note"],
+                      "a clone that is still filling in must say so, or the "
+                      "caller reads an empty list_services as a failed clone")
+
+    async def test_creating_without_a_source_sends_no_clone_fields(self):
+        """An omitted source must not travel as an empty string — Railway would
+        take that for an id."""
+        session = self.install({"environmentCreate": {"environmentCreate": {
+            "id": "env-new", "name": "scratch", "projectId": "p1",
+            "isEphemeral": False, "createdAt": "2026-08-13T10:00:00Z"}}})
+        result = json.loads(await _text(server.mcp.call_tool(
+            "create_environment", {"name": "scratch", "project_id": "p1"})))
+
+        self.assertEqual({"projectId": "p1", "name": "scratch"},
+                         session.calls[0]["variables"]["input"])
+        self.assertIsNone(result["clonedFrom"])
+
+    async def test_creating_without_a_project_creates_nothing(self):
+        """Our own refusal, so nothing explains it for us: it must name both
+        ways forward and cost no request."""
+        original = server.DEFAULT_PROJECT
+        server.DEFAULT_PROJECT = ""
+        self.addCleanup(setattr, server, "DEFAULT_PROJECT", original)
+        session = self.install({"environmentCreate": {"environmentCreate": {}}})
+        result = json.loads(await _text(server.mcp.call_tool(
+            "create_environment", {"name": "pr-42"})))
+
+        self.assertIn("MCP_DEFAULT_PROJECT_ID", result["error"])
+        self.assertIn("Nothing was created", result["error"])
+        self.assertEqual([], session.calls)
+
+    # ── delete ──────────────────────────────────────────────────────
+
+    async def test_an_ephemeral_name_is_deleted_and_named(self):
+        """The happy path the preview script rides: a pr- environment goes
+        without a flag, and the answer says which one went."""
+        result, session = await self._delete(
+            {**self._env("pr-42"), **self._PROJECT, **self._DELETE},
+            {"environment_id": "env-1"})
+
+        self.assertNotIn("error", result)
+        self.assertIs(True, result["deleted"])
+        self.assertEqual("pr-42", result["environmentName"])
+        self.assertIn("cannot be undone", result["note"])
+        self.assertEqual(["env-1"],
+                         [d["variables"]["id"] for d in self._deletions(session)])
+
+    async def test_railways_own_ephemeral_flag_is_enough(self):
+        """Railway tags its PR environments isEphemeral without using our
+        prefixes; that is the same statement, made by the platform."""
+        result, _ = await self._delete(
+            {**self._env("gh-1234", ephemeral=True), **self._PROJECT, **self._DELETE},
+            {"environment_id": "env-1"})
+
+        self.assertNotIn("error", result)
+        self.assertIs(True, result["deleted"])
+
+    async def test_an_ordinary_environment_needs_the_intent_spelled_out(self):
+        """'staging' is nobody's throwaway. Refuse first, and say exactly what
+        would unlock it — a refusal without a way forward gets worked around."""
+        result, session = await self._delete(
+            {**self._env("staging"), **self._PROJECT, **self._DELETE},
+            {"environment_id": "env-1"})
+
+        self.assertIn("does not look like a throwaway", result["error"])
+        self.assertIn("confirm_permanent_delete=true", result["error"])
+        self.assertEqual("staging", result["environmentName"])
+        self.assertEqual([], self._deletions(session),
+                         "an unconfirmed delete fired anyway")
+
+        result, session = await self._delete(
+            {**self._env("staging"), **self._PROJECT, **self._DELETE},
+            {"environment_id": "env-1", "confirm_permanent_delete": True})
+
+        self.assertNotIn("error", result)
+        self.assertEqual(["env-1"],
+                         [d["variables"]["id"] for d in self._deletions(session)])
+
+    async def test_production_and_test_are_refused_even_when_confirmed(self):
+        """The flag must not be a master key. These two are the environments a
+        preview loop has no business reaching, whatever it passes."""
+        for name in ("production", "Production", "test"):
+            with self.subTest(name=name):
+                result, session = await self._delete(
+                    {**self._env(name), **self._PROJECT, **self._DELETE},
+                    {"environment_id": "env-1",
+                     "confirm_permanent_delete": True})
+
+                self.assertIn("protected", result["error"])
+                self.assertIn(name, result["error"],
+                              "the refusal does not name the environment")
+                self.assertEqual([], self._deletions(session))
+
+    async def test_the_projects_default_environment_is_refused_by_id(self):
+        """A default environment need not be called production — the project
+        says which one it is, and that answer wins over the name."""
+        result, session = await self._delete(
+            {**self._env("main", env_id="env-prod"), **self._PROJECT, **self._DELETE},
+            {"environment_id": "env-prod", "confirm_permanent_delete": True})
+
+        self.assertIn("default environment", result["error"])
+        self.assertIn("riskwave-app", result["error"])
+        self.assertEqual([], self._deletions(session))
+
+    async def test_an_unconfirmable_id_deletes_nothing(self):
+        """Same guard as delete_service: if Railway will not read the
+        environment back, the mutation must not fire at all."""
+        result, session = await self._delete(
+            {"environment(id:": {"errors": [{"message": "Not Authorized"}]},
+             **self._PROJECT, **self._DELETE},
+            {"environment_id": "env-typo"})
+
+        self.assertIn("env-typo", result["error"])
+        self.assertIn("Not Authorized", result["error"],
+                      "the platform's own message must survive, not be swallowed")
+        self.assertEqual([], self._deletions(session))
+
+    async def test_an_unreadable_project_does_not_unlock_the_delete(self):
+        """The default-environment check is a guard, so failing to run it must
+        refuse — not fall through to the delete."""
+        result, session = await self._delete(
+            {**self._env("pr-42"),
+             "project(id:": {"errors": [{"message": "Not Authorized"}]},
+             **self._DELETE},
+            {"environment_id": "env-1"})
+
+        self.assertIn("Nothing was deleted", result["error"])
+        self.assertEqual([], self._deletions(session))
+
+    async def test_an_unknown_environment_deletes_nothing(self):
+        result, session = await self._delete(
+            {"environment(id:": {"environment": None}, **self._DELETE},
+            {"environment_id": "env-gone"})
+
+        self.assertIn("No environment with id env-gone", result["error"])
+        self.assertEqual([], self._deletions(session))
+
+    # ── deployment trigger ──────────────────────────────────────────
+
+    async def test_the_single_trigger_for_that_service_is_repointed(self):
+        """A trigger belongs to one service in one environment; the update must
+        hit that one's id, not the first trigger in the project."""
+        session = self.install({
+            "deploymentTriggers(": {"deploymentTriggers": {"edges": [
+                {"node": {"id": "trg-1", "branch": "main", "repository": "o/r",
+                          "serviceId": "svc-1", "environmentId": "env-1"}}]}},
+            "deploymentTriggerUpdate": {"deploymentTriggerUpdate": {
+                "id": "trg-1", "branch": "feat/x", "repository": "o/r",
+                "serviceId": "svc-1", "environmentId": "env-1"}}})
+        result = json.loads(await _text(server.mcp.call_tool(
+            "update_deployment_trigger",
+            {"environment_id": "env-1", "service_id": "svc-1",
+             "branch": "feat/x", "project_id": "p1"})))
+
+        update = [c for c in session.calls if "deploymentTriggerUpdate" in c["query"]]
+        self.assertEqual(1, len(update))
+        self.assertEqual("trg-1", update[0]["variables"]["id"])
+        self.assertEqual({"branch": "feat/x"}, update[0]["variables"]["input"])
+        self.assertEqual("main", result["previousBranch"])
+        self.assertIn("nothing was deployed", result["note"].lower(),
+                      "a config-only write that reads as a deploy is how an "
+                      "agent reports new code live that never built")
+
+    async def test_a_service_with_no_trigger_is_refused(self):
+        """An image-sourced service has no trigger. Creating one is a different
+        operation, so this must refuse and say so rather than write nothing and
+        report success."""
+        session = self.install({
+            "deploymentTriggers(": {"deploymentTriggers": {"edges": []}},
+            "deploymentTriggerUpdate": {"deploymentTriggerUpdate": {}}})
+        result = json.loads(await _text(server.mcp.call_tool(
+            "update_deployment_trigger",
+            {"environment_id": "env-1", "service_id": "svc-1",
+             "branch": "feat/x", "project_id": "p1"})))
+
+        self.assertIn("no deployment trigger", result["error"])
+        self.assertEqual([], [c for c in session.calls
+                              if "deploymentTriggerUpdate" in c["query"]])
+
+    async def test_more_than_one_trigger_is_refused_and_both_are_shown(self):
+        session = self.install({
+            "deploymentTriggers(": {"deploymentTriggers": {"edges": [
+                {"node": {"id": "trg-1", "branch": "main", "repository": "o/r",
+                          "serviceId": "svc-1", "environmentId": "env-1"}},
+                {"node": {"id": "trg-2", "branch": "dev", "repository": "o/r",
+                          "serviceId": "svc-1", "environmentId": "env-1"}}]}},
+            "deploymentTriggerUpdate": {"deploymentTriggerUpdate": {}}})
+        result = json.loads(await _text(server.mcp.call_tool(
+            "update_deployment_trigger",
+            {"environment_id": "env-1", "service_id": "svc-1",
+             "branch": "feat/x", "project_id": "p1"})))
+
+        self.assertIn("does not identify one", result["error"])
+        self.assertEqual({"trg-1", "trg-2"}, {t["id"] for t in result["triggers"]})
+        self.assertEqual([], [c for c in session.calls
+                              if "deploymentTriggerUpdate" in c["query"]])
+
+    async def test_an_empty_branch_changes_nothing(self):
+        session = self.install({
+            "deploymentTriggers(": {"deploymentTriggers": {"edges": []}}})
+        result = json.loads(await _text(server.mcp.call_tool(
+            "update_deployment_trigger",
+            {"environment_id": "env-1", "service_id": "svc-1",
+             "branch": "", "project_id": "p1"})))
+
+        self.assertIn("Nothing was changed", result["error"])
+        self.assertEqual([], session.calls)
+
+
 class ListProjectsFailureTest(_StubbedServer):
     """list_projects tries a fast path and two fallbacks. Each swallows its own
     exception so the next one runs — correct — but when all of them come up
@@ -2957,6 +3223,9 @@ class MissingDefaultProjectTest(_StubbedServer):
         "list_volumes": {},
         "delete_service": {"name": "some-service"},
         "create_service": {"project_id": "", "environment_id": "e1", "name": "s"},
+        "create_environment": {"name": "pr-42"},
+        "update_deployment_trigger": {"environment_id": "e1",
+                                      "service_id": "s1", "branch": "main"},
     }
 
     async def test_each_one_explains_what_to_do_instead(self):

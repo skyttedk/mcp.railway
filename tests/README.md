@@ -49,6 +49,19 @@ confirm must each leave the account untouched and say which service was meant.
 The happy path is held to deleting exactly one service and naming it, so a
 transcript records what was destroyed.
 
+And one class for the environment lifecycle (`EnvironmentLifecycleTest`),
+because `environmentDelete` is the second operation with no undo and the wider
+of the two: it takes every service instance in the environment, their variables,
+deployments and volume data. These tools exist to be driven by an
+ephemeral-preview loop, so the property under test is that such a loop can only
+ever reach the environments it made — a `pr-`/`preview-`/`ephemeral-` name (or
+Railway's own `isEphemeral`) is deleted, anything else needs the intent spelled
+out, and `production`, `test` and the project's own default environment are
+refused whatever is passed. A project lookup that fails must refuse too, rather
+than fall through. `update_deployment_trigger` is here for the same reason in
+miniature: with no single trigger to rewrite it must refuse instead of guessing,
+and its answer must not read as a deploy, since it starts no build.
+
 And one class for deploying for real (`CreateDeploymentTest`), because the two
 neighbouring tools are easy to confuse and the confusion is silent: `deploy`
 restarts the container already running and builds nothing, so an agent that

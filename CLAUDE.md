@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 An MCP server for Railway hosting, talking straight to Railway's GraphQL API
 (`https://backboard.railway.com/graphql/v2`) — no Railway CLI involved. It covers
 projects, services, environments, variables, deployments, logs, metrics, domains
-and volumes: 37 tools, all of them in one file, `server.py`.
+and volumes: 40 tools, all of them in one file, `server.py`.
 Repo: `skyttedk/mcp.railway`.
 
 It runs two ways from that same file. `MCP_TRANSPORT` unset (or anything other
@@ -71,8 +71,8 @@ py -3.12 -m venv .venv
 The suite is stdlib `unittest`, so there is no test framework to install, but it
 imports `server.py` and therefore needs `requirements.txt` installed. It needs no
 Railway credentials and never contacts the Railway API: it swaps `server._session`
-for a fake at the HTTP boundary and refuses any call that forgets to. **143 tests,
-0.91 s, verified 2026-08-10** on Python 3.12.10. `tests/README.md` explains what
+for a fake at the HTTP boundary and refuses any call that forgets to. **165 tests,
+1.0 s, verified 2026-08-13** on Python 3.12.10. `tests/README.md` explains what
 each class is protecting and why.
 
 GitHub Actions runs the same command on every push and pull request
@@ -84,7 +84,7 @@ on purpose. Confirm the change is wanted, then regenerate and commit the snapsho
 alongside it:
 
 ```powershell
-.\.venv\Scripts\python.exe tests\test_server.py --refresh   # "wrote 37 tools to …"
+.\.venv\Scripts\python.exe tests\test_server.py --refresh   # "wrote 40 tools to …"
 ```
 
 ## Deploy
@@ -140,7 +140,7 @@ cheapest liveness check.
   using the injected value.
 - **A tool's failure is explained at the boundary, not in the tool.** Everything
   raised out of `_query_sync` is a `RailwayCallError` whose `str()` is already
-  the finished sentence `_why` produces — so all 37 tools report a refused
+  the finished sentence `_why` produces — so all 40 tools report a refused
   token, an unreachable Railway, a 5xx, a non-JSON edge page and a GraphQL
   refusal in the same words, and the next improvement to `_why` reaches all of
   them at once. Until 2026-08-07 only the GraphQL branch was dressed up and only
@@ -392,6 +392,38 @@ cheapest liveness check.
   day; `set_build_command` (2026-08-09) and the four split out on 2026-08-10
   (`set_dockerfile_path`, `set_root_directory`, `set_healthcheck`,
   `set_num_replicas`) were written with them from the start.
+- **An environment is deleted by a script, not by a person — so the guard is in
+  the tool.** `create_environment` / `delete_environment` /
+  `update_deployment_trigger` (2026-08-13) exist for ephemeral previews: one
+  environment per card, cloned from `test`, destroyed on close. That makes
+  `environmentDelete` the second irreversible operation here after
+  `serviceDelete`, and the wider one — it takes every service INSTANCE in the
+  environment, their variables, deployments and volume data, while the services
+  themselves survive in the other environments. Railway's mutation is a bare
+  `environmentDelete(id:)` that asks nothing. So `delete_environment` reads the
+  environment back first (an id Railway will not confirm deletes nothing, same
+  guard as `delete_service`), then judges the name: the `pr-`/`preview-`/
+  `ephemeral-` prefixes or Railway's own `isEphemeral` go straight through,
+  anything else needs `confirm_permanent_delete=True`, and `production`, `test`
+  and whichever environment the project names as its `baseEnvironmentId` /
+  `primaryEnvironmentId` are refused **whatever** is passed — a flag that can
+  unlock those is a flag a retry loop will eventually pass. A project lookup
+  that fails refuses too, rather than falling through to the delete.
+  `EnvironmentLifecycleTest` pins every refusal and that each one costs no
+  mutation. Schema facts, confirmed by introspection (Railway answers
+  introspection without a token) rather than from memory:
+  `EnvironmentCreateInput` carries `projectId`, `name`, `sourceEnvironmentId`
+  (this is the whole of "duplicate") and `ephemeral`; there is no
+  `EnvironmentDeleteInput`; and a deployment trigger is reached through the
+  top-level `deploymentTriggers(projectId:, environmentId:, serviceId:)` query —
+  `Project` has no `deploymentTriggers` field, so going via the project is a
+  dead end. **`environmentCreate` returns before the clone is finished**: the
+  environment exists, its copied services and their deployments arrive in the
+  background, which is why the tool's answer says to poll `list_services`
+  instead of trusting the success. And `update_deployment_trigger` writes
+  configuration only — it starts no build, which its `note` says outright,
+  because a config write that reads as a deploy is how an agent reports new
+  code live that never built.
 - **`deploy` and `create_deployment` are not the same operation, and the
   confusion is silent.** `deploy` restarts the container already running and
   builds nothing, so an agent reaching for it sees a success and reports that new
