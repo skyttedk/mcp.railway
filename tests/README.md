@@ -285,6 +285,26 @@ The routes in `SplitOutSetterTest`, `HealthcheckTimeoutTest` and
 answers the verify read with a bare instance is now a Railway that dropped the
 write, so a happy-path test has to say what it stored.
 
+## `SetVariablesMergeTest` — a write that addresses a whole collection
+
+`set_variables` handed the caller's dict to `variableCollectionUpsert` without
+ever sending the input's `replace` field, so the difference between setting one
+variable and deleting every secret on the service was Railway's default to
+decide — and the docstring, one line long, mentioned neither outcome. A deploy
+routine that nudges a rebuild by writing a dummy variable is exactly the caller
+that cannot afford to guess. Introspection (no token needed) says the default is
+`false`, i.e. a merge, so nothing was being wiped; the field is sent explicitly
+in both states anyway, because a vendor default is the vendor's to change and
+this one turns a write into a wipe. The tests pin the field's presence and both
+values, the merge default, and the two answers: a merge that removes nothing and
+a replace that names the keys it deleted. The rest is the rule the other write
+paths already follow — read the collection back and report names only, never a
+value; a key that did not land is an error rather than a success; a read-back
+Railway refuses leaves the landing unknown; and the before-read is a guard, not
+only a diff, so a collection that cannot be read first is not written at all. The
+last test holds the docstring itself, since the description is the only thing a
+caller reads before firing the tool.
+
 ## `RegionMetroGroupingTest` — thirteen names, five places
 
 `list_regions` returned Railway's flat array, in which the shared metro code

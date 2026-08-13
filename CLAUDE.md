@@ -71,7 +71,7 @@ py -3.12 -m venv .venv
 The suite is stdlib `unittest`, so there is no test framework to install, but it
 imports `server.py` and therefore needs `requirements.txt` installed. It needs no
 Railway credentials and never contacts the Railway API: it swaps `server._session`
-for a fake at the HTTP boundary and refuses any call that forgets to. **175 tests,
+for a fake at the HTTP boundary and refuses any call that forgets to. **185 tests,
 1.4 s, verified 2026-08-13** on Python 3.12.10. `tests/README.md` explains what
 each class is protecting and why.
 
@@ -441,6 +441,32 @@ cheapest liveness check.
   configuration only — it starts no build, which its `note` says outright,
   because a config write that reads as a deploy is how an agent reports new
   code live that never built.
+- **`set_variables` writes a whole COLLECTION, and until 2026-08-13 nothing
+  said so.** `variableCollectionUpsert` takes the dict as the collection, and
+  its input's `replace` field decides whether that is merged into the stored
+  one or becomes it. The tool never sent the field, so the outcome rested on
+  Railway's default — the difference between setting one variable and deleting
+  every secret on the service, invisible from a docstring that read "Set
+  variables on a Railway service." The caller this bites is the ordinary one: a
+  PM routine that forces a rebuild by writing a dummy `DEPLOY_NUDGE`.
+  Introspection settles the default (Railway answers introspection without a
+  token): on `VariableCollectionUpsertInput`, `replace` is a nullable `Boolean`
+  with `defaultValue` `"false"`, described as "When set to true, removes all
+  existing variables before upserting the new collection" — so the old silence
+  was a merge and nothing was ever wiped by it. It is sent explicitly in both
+  states regardless, because a server-side default is the vendor's to change
+  and this one turns a write into a wipe. `replace=True` deletes every key not
+  listed, with no undo. **The answer is a new shape** — `{updated, replace,
+  keysSet, keysNow, keysRemoved, verified}` instead of Railway's bare
+  `{"variableCollectionUpsert": true}` — names only, never values, the same
+  rule `list_variables`/`check_variable` hold on the read side. The collection
+  is read before and after: the after-read turns "Railway said true" into
+  evidence and names what a replace removed, and the before-read is a guard as
+  much as a diff, so a collection Railway will not show is not written over
+  (same doctrine as `_instance_missing`). `SetVariablesMergeTest` pins all of
+  it, including the docstring. Unused neighbour on the same input, should it
+  ever be wanted: `skipDeploys` (Boolean, default `false`) writes variables
+  without triggering the redeploy they normally cause.
 - **`deploy` and `create_deployment` are not the same operation, and the
   confusion is silent.** `deploy` restarts the container already running and
   builds nothing, so an agent reaching for it sees a success and reports that new
