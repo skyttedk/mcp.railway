@@ -3398,6 +3398,26 @@ class ContainerLivenessTest(_StubbedServer):
                       "get_logs no longer documents the field that carries the "
                       "evidence")
 
+    async def test_the_probe_only_ever_asks_for_container_measurements(self):
+        """The whole check rests on measurements that stop when the process
+        does. A volume-scoped one — DISK_USAGE_GB, BACKUP_USAGE_GB, or the
+        ephemeral variant — keeps reporting the same non-zero number with no
+        container anywhere, so adding one to this list would turn stored bytes
+        into "resource-use-seen" and silence the accusation the probe exists to
+        make. Nothing else guards that list; it is a hardcoded tuple one edit
+        away from reintroducing the five-month-dead-Postgres defect."""
+        self.assertEqual(("CPU_USAGE", "MEMORY_USAGE_GB"),
+                         server._CONTAINER_PROBE_MEASUREMENTS,
+                         "the container probe's measurement list changed — only "
+                         "measurements a CONTAINER produces may be in it")
+
+        for volume_scoped in ("DISK_USAGE_GB", "BACKUP_USAGE_GB",
+                              "EPHEMERAL_DISK_USAGE_GB"):
+            self.assertNotIn(volume_scoped, server._CONTAINER_PROBE_MEASUREMENTS,
+                             f"{volume_scoped} describes the volume, which "
+                             "outlives every deployment — a dead service would "
+                             "read as healthy")
+
 
 class ExplainedFailureTest(_StubbedServer):
     """Every tool explains a failed Railway call, not just list_projects.
