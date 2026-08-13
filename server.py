@@ -652,9 +652,12 @@ def _update_rejected(data: dict, environment_id: str, service_id: str) -> str | 
 # mutation all read back correctly within the same call sequence, so there is
 # no lag to tolerate and no retry to add.
 #
-# Deliberately generic, and deliberately not yet wired into the other setters:
-# `set_build_command`'s clear path shows the same symptom and is its own card,
-# so this is shaped to be reused there rather than being about region alone.
+# Generic on purpose, and now used by three tools: `set_region`, where Railway
+# drops the write whatever is sent, and `set_build_command`/`set_healthcheck`,
+# where it keeps a value and drops an explicit null — so the clear is the half
+# that used to report a success nobody had checked. Both call it for every
+# write, not only the clear: a tool that echoes back a value it did not read is
+# guessing regardless of which value it is, and the extra read is one query.
 async def _write_unconfirmed(environment_id: str, service_id: str, field: str,
                              expected, action: str, hint: str = "") -> str | None:
     """Re-read one service-instance field after a write. None when it landed.
@@ -837,6 +840,21 @@ async def set_build_command(environment_id: str, service_id: str, build_command:
     The change only takes effect on the next deploy — pass redeploy=true to
     trigger one immediately.
 
+    CLEARING IS CURRENTLY BROKEN ON RAILWAY'S SIDE, and this tool now says so
+    instead of reporting success: Railway accepts the explicit null, answers
+    `true`, and leaves the stored build command exactly where it was — verified
+    live 2026-08-10, while a `set_num_replicas` through the identical mutation
+    seconds later landed. Setting a value works. So a clear returns an error
+    naming what was asked for and what Railway still reports, there is nothing
+    to retry, and the way to remove a build command today is the Railway
+    dashboard. Clearing a service that has no build command to begin with is
+    reported as success, honestly — the end state asked for is the end state
+    read back.
+    Every write is read back, not only the clear, so the value echoed in the
+    answer is one this tool has seen rather than one it assumed; a verification
+    that fails also skips the redeploy, so a dropped write never costs a
+    pointless deployment.
+
     set_service_config also carries build_command, for changing it together
     with other build settings in a single write; this tool is the standalone
     one, and the two write the same field.
@@ -854,9 +872,20 @@ async def set_build_command(environment_id: str, service_id: str, build_command:
     rejected = _update_rejected(data, environment_id, service_id)
     if rejected:
         return rejected
+    # The mutation's `true` means "accepted", not "applied" — see
+    # _write_unconfirmed. Checked BEFORE any redeploy: triggering a deployment
+    # to pick up a change that was never stored just moves the surprise later.
+    unconfirmed = await _write_unconfirmed(
+        environment_id, service_id, "buildCommand", build_command or None,
+        "set_build_command",
+        hint="Railway drops an explicit null on this field while keeping a "
+             "value, so clearing a build command through the API does nothing. "
+             "Clear it from the Railway dashboard.")
+    if unconfirmed:
+        return unconfirmed
     result: dict = {"serviceId": service_id, "environmentId": environment_id,
                     "buildCommand": build_command or None, "updated": True,
-                    "redeployed": False}
+                    "verified": True, "redeployed": False}
     if redeploy:
         await _query("""mutation($sid: String!, $eid: String!) {
           serviceInstanceRedeploy(serviceId: $sid, environmentId: $eid)
@@ -973,6 +1002,22 @@ async def set_healthcheck(environment_id: str, service_id: str,
     The change only takes effect on the next deploy — pass redeploy=true to
     trigger one immediately.
 
+    CLEARING THE PATH IS CURRENTLY BROKEN ON RAILWAY'S SIDE, and this tool now
+    says so instead of reporting success: Railway accepts the explicit null,
+    answers `true`, and leaves the stored path exactly where it was — verified
+    live 2026-08-10, the same defect set_build_command has, while a value
+    written through the identical mutation lands. So a clear returns an error
+    naming what was asked for and what Railway still reports, there is nothing
+    to retry, and the way to remove a healthcheck today is the Railway
+    dashboard. Clearing a service that has no healthcheck to begin with is
+    reported as success, honestly — the end state asked for is the end state
+    read back.
+    The path is read back on every write, not only the clear. The TIMEOUT is
+    not: it has no clear, an omitted key is untouched rather than null, and
+    nothing suggests Railway drops it — so `healthcheckTimeout` in the answer
+    is still only what was sent. Read it with get_service_instance if it
+    matters.
+
     set_service_config carries healthcheck_path and healthcheck_timeout too,
     for changing them together with other deploy settings in a single write;
     this tool is the standalone one, and the two write the same fields.
@@ -995,9 +1040,24 @@ async def set_healthcheck(environment_id: str, service_id: str,
     rejected = _update_rejected(data, environment_id, service_id)
     if rejected:
         return rejected
+    # Same read-back as set_build_command, and for the same reason: the clear
+    # is dropped while a value is kept, and the mutation says `true` either
+    # way. Only the path is verified — see the docstring on the timeout.
+    unconfirmed = await _write_unconfirmed(
+        environment_id, service_id, "healthcheckPath", healthcheck_path or None,
+        "set_healthcheck",
+        hint="Railway drops an explicit null on this field while keeping a "
+             "value, so clearing a healthcheck through the API does nothing. "
+             "Clear it from the Railway dashboard." + (
+                 " A healthcheck_timeout was sent in the same write and is not "
+                 "read back, so it may have been stored even though the path "
+                 "was not — check get_service_instance."
+                 if healthcheck_timeout is not None else ""))
+    if unconfirmed:
+        return unconfirmed
     result: dict = {"serviceId": service_id, "environmentId": environment_id,
                     "healthcheckPath": healthcheck_path or None, "updated": True,
-                    "redeployed": False}
+                    "verified": True, "redeployed": False}
     if healthcheck_timeout is not None:
         result["healthcheckTimeout"] = healthcheck_timeout
     if redeploy:

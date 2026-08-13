@@ -2421,11 +2421,32 @@ class BuildCommandTest(_StubbedServer):
     "untouched" to ServiceInstanceUpdateInput, not "reset"), the redeploy is
     opt-in, and a missing service instance is refused rather than reported as
     written.
+
+    And it mirrors it in the defect too: sending the null is necessary but not
+    sufficient, because Railway accepts that null, answers `true` and keeps the
+    stored command — verified live 2026-08-10, in the same session where a
+    `set_num_replicas` through the identical mutation landed. So the write is
+    read back, exactly as set_region's is, and a clear that changed nothing is
+    an error rather than the success it used to invent. The read-back covers
+    every write, not only the clear: a value echoed back unread is a guess
+    whichever value it is.
     """
 
+    # No buildCommand in the payload, so the field reads back null — a Railway
+    # that kept whatever it had is `_stored(...)` below. The guard read, the
+    # verify read and get_service_instance are all the same
+    # `serviceInstance(serviceId:` query, so one route answers all three.
     _ROUTE = {"serviceInstanceUpdate": {"serviceInstanceUpdate": True},
               "serviceInstance(serviceId": {
                   "serviceInstance": {"serviceId": "svc1", "serviceName": "web"}}}
+
+    @staticmethod
+    def _stored(build_command) -> dict:
+        """A Railway that actually keeps what set_build_command writes."""
+        return {"serviceInstanceUpdate": {"serviceInstanceUpdate": True},
+                "serviceInstance(serviceId": {
+                    "serviceInstance": {"serviceId": "svc1", "serviceName": "web",
+                                        "buildCommand": build_command}}}
 
     @staticmethod
     def _sent(session: _FakeSession) -> dict:
@@ -2443,19 +2464,25 @@ class BuildCommandTest(_StubbedServer):
             server.mcp.call_tool("set_build_command", args))), session
 
     async def test_a_build_command_is_written(self):
-        result, session = await self._set(self._ROUTE, "npm run build")
+        result, session = await self._set(self._stored("npm run build"),
+                                          "npm run build")
 
         self.assertEqual({"buildCommand": "npm run build"}, self._sent(session),
                          "the write must touch buildCommand and nothing else")
         self.assertEqual("npm run build", result["buildCommand"])
         self.assertTrue(result["updated"])
+        self.assertTrue(result["verified"])
         self.assertFalse(result["redeployed"])
         self.assertIn("next deploy", result["note"])
 
     async def test_an_empty_build_command_clears_the_override(self):
         """The key must be present and null, exactly as set_start_command and
         set_region send their clear — dropping it leaves Railway's stored
-        override in place, which is the state this card was filed about."""
+        override in place, which is the state this card was filed about.
+
+        _ROUTE reads the field back as null, i.e. a service with no build
+        command to remove: the end state asked for is the end state observed,
+        so this is a success and honestly one."""
         result, session = await self._set(self._ROUTE, "")
 
         sent = self._sent(session)
@@ -2464,12 +2491,71 @@ class BuildCommandTest(_StubbedServer):
         self.assertIsNone(sent["buildCommand"])
         self.assertIsNone(result["buildCommand"])
         self.assertTrue(result["updated"])
+        self.assertTrue(result["verified"])
+
+    async def test_a_dropped_clear_is_an_error_not_a_success(self):
+        """The defect this card was filed about: Railway takes the explicit
+        null, answers true and keeps the command. `updated: true` on the
+        strength of that boolean is a lie — and unlike set_region's, this one
+        only appears when clearing, since a value written the same way lands.
+        """
+        result, _ = await self._set(self._stored("npm run build"), "")
+
+        self.assertNotIn("updated", result)
+        self.assertFalse(result["verified"])
+        self.assertIsNone(result["sent"])
+        self.assertEqual("npm run build", result["observed"])
+        # Both values belong in the sentence: "it did not work" without them
+        # sends the next reader looking in the wrong layer.
+        self.assertIn("npm run build", result["error"])
+        self.assertIn("dashboard", result["error"])
+        self.assertIn("svc1", result["error"])
+        self.assertIn("e1", result["error"])
+
+    async def test_a_dropped_clear_is_verified_before_any_redeploy(self):
+        """A deployment triggered to pick up a change that was never stored
+        restarts a service for nothing and moves the surprise later."""
+        routes = {**self._stored("npm run build"),
+                  "serviceInstanceRedeploy": {"serviceInstanceRedeploy": True}}
+        result, session = await self._set(routes, "", redeploy=True)
+
+        self.assertFalse(result["verified"])
+        self.assertEqual([], [c for c in session.calls
+                              if "serviceInstanceRedeploy" in c["query"]])
+
+    async def test_the_check_reads_back_after_the_write_not_before(self):
+        """A verification satisfied by the guard read the tool already made
+        would pass while proving nothing, so the order is the guarantee."""
+        _, session = await self._set(self._stored("npm run build"), "")
+
+        kinds = ["write" if "serviceInstanceUpdate" in c["query"] else "read"
+                 for c in session.calls]
+        self.assertEqual(["read", "write", "read"], kinds)
+
+    async def test_railway_refusing_the_check_is_not_reported_as_success(self):
+        """Third outcome, distinct from both: the write went out and then the
+        read-back failed, so whether it landed is unknown. Reporting that as
+        success is the original bug wearing a different hat."""
+        routes = {**self._ROUTE, "serviceInstance(serviceId": [
+            {"serviceInstance": {"serviceId": "svc1", "serviceName": "web"}},
+            {"errors": [{"message": "Not Authorized"}]},
+        ]}
+        result, session = await self._set(routes, "")
+
+        self.assertNotIn("updated", result)
+        self.assertFalse(result["verified"])
+        self.assertIn("would not confirm", result["error"])
+        self.assertIn("Not Authorized", result["error"])
+        # The write really was attempted — this is not the pre-write guard.
+        self.assertEqual(1, len([c for c in session.calls
+                                 if "serviceInstanceUpdate" in c["query"]]))
 
     async def test_redeploy_is_opt_in(self):
-        routes = {**self._ROUTE,
+        stored = self._stored("npm run build")
+        routes = {**stored,
                   "serviceInstanceRedeploy": {"serviceInstanceRedeploy": True}}
 
-        quiet, session = await self._set(self._ROUTE, "npm run build")
+        quiet, session = await self._set(stored, "npm run build")
         self.assertFalse(quiet["redeployed"])
         self.assertEqual([], [c for c in session.calls
                               if "serviceInstanceRedeploy" in c["query"]])
@@ -2522,6 +2608,14 @@ class SplitOutSetterTest(_StubbedServer):
     Written as a table because the sameness IS the property: a divergence in
     one of the four is the bug worth catching, and a table makes it impossible
     to cover three of them and quietly forget the fourth.
+
+    One deliberate divergence since 2026-08-13: `set_healthcheck` reads its
+    path back after the write, because Railway drops the clear on that field
+    (the set_build_command defect, confirmed on both). The other three are
+    string setters on the same input and very likely share it — nothing here
+    claims otherwise; they simply have no live evidence yet, which is a card
+    and not a reason to guess. So the table's routes now answer the
+    healthcheck read, and the clear case gets a route of its own.
     """
 
     # tool -> (arguments it takes, the input payload that must reach Railway)
@@ -2539,9 +2633,15 @@ class SplitOutSetterTest(_StubbedServer):
                   "set_root_directory": ("root_directory", "rootDirectory"),
                   "set_healthcheck": ("healthcheck_path", "healthcheckPath")}
 
+    # Echoes the healthcheck path set_healthcheck now reads back, so this is a
+    # Railway that stored what the table writes. _CLEARED is the same route
+    # with the path gone — what a successful clear reads back as.
     _ROUTE = {"serviceInstanceUpdate": {"serviceInstanceUpdate": True},
               "serviceInstance(serviceId": {
-                  "serviceInstance": {"serviceId": "svc1", "serviceName": "web"}}}
+                  "serviceInstance": {"serviceId": "svc1", "serviceName": "web",
+                                      "healthcheckPath": "/healthz"}}}
+    _CLEARED = {**_ROUTE, "serviceInstance(serviceId": {
+        "serviceInstance": {"serviceId": "svc1", "serviceName": "web"}}}
 
     @staticmethod
     def _sent(session: _FakeSession) -> dict:
@@ -2582,7 +2682,7 @@ class SplitOutSetterTest(_StubbedServer):
         override in place, which reads back as a change that never happened."""
         for tool, (arg, field) in self._CLEARABLE.items():
             with self.subTest(tool=tool):
-                result, session = await self._set(tool, self._ROUTE, {arg: ""})
+                result, session = await self._set(tool, self._CLEARED, {arg: ""})
 
                 sent = self._sent(session)
                 self.assertIn(field, sent,
@@ -2662,12 +2762,18 @@ class HealthcheckTimeoutTest(_StubbedServer):
     mentioned while it looked like a plain path change.
     """
 
+    # The path is read back after the write, so the route has to answer as a
+    # Railway that stored it; _CLEARED is the same one with no path, which is
+    # what a clear that landed reads back as.
     _ROUTE = {"serviceInstanceUpdate": {"serviceInstanceUpdate": True},
               "serviceInstance(serviceId": {
-                  "serviceInstance": {"serviceId": "svc1", "serviceName": "web"}}}
+                  "serviceInstance": {"serviceId": "svc1", "serviceName": "web",
+                                      "healthcheckPath": "/healthz"}}}
+    _CLEARED = {**_ROUTE, "serviceInstance(serviceId": {
+        "serviceInstance": {"serviceId": "svc1", "serviceName": "web"}}}
 
-    async def _set(self, **args) -> tuple[dict, dict]:
-        session = self.install(self._ROUTE)
+    async def _set(self, routes: dict | None = None, **args) -> tuple[dict, dict]:
+        session = self.install(routes or self._ROUTE)
         call = {"environment_id": "e1", "service_id": "svc1", **args}
         result = json.loads(await _text(server.mcp.call_tool("set_healthcheck", call)))
         sent = [c for c in session.calls
@@ -2695,11 +2801,112 @@ class HealthcheckTimeoutTest(_StubbedServer):
         gone, so the stored timeout is harmless — and inventing a write for it
         would destroy the value a caller wants back when they restore the
         path."""
-        result, sent = await self._set(healthcheck_path="")
+        result, sent = await self._set(self._CLEARED, healthcheck_path="")
 
         self.assertEqual({"healthcheckPath": None}, sent)
         self.assertIsNone(result["healthcheckPath"])
         self.assertTrue(result["updated"])
+
+
+class HealthcheckClearTest(_StubbedServer):
+    """The other half of the dropped-clear defect (2026-08-13).
+
+    `set_healthcheck ""` and `set_build_command ""` were confirmed live on
+    2026-08-10 to report success and change nothing: Railway takes the explicit
+    null on these fields, answers `true`, and keeps the stored value, while a
+    value written through the identical mutation seconds later lands. Two
+    distinct Railway behaviours, then, not one — `region` is dropped whatever
+    is sent (RegionOverrideTest), these two only when cleared — and the same
+    answer to both, `_write_unconfirmed`: read the field back and say what
+    Railway actually reports.
+
+    BuildCommandTest holds the build-command half; this class is set_healthcheck
+    alone, because its clear is the one that also carries a second field the
+    check does not cover.
+    """
+
+    _STORED = {"serviceInstanceUpdate": {"serviceInstanceUpdate": True},
+               "serviceInstance(serviceId": {
+                   "serviceInstance": {"serviceId": "svc1", "serviceName": "web",
+                                       "healthcheckPath": "/healthz"}}}
+
+    async def _set(self, routes: dict, **args) -> tuple[dict, _FakeSession]:
+        session = self.install(routes)
+        call = {"environment_id": "e1", "service_id": "svc1", **args}
+        result = json.loads(await _text(server.mcp.call_tool("set_healthcheck", call)))
+        return result, session
+
+    async def test_a_dropped_clear_is_an_error_not_a_success(self):
+        result, _ = await self._set(self._STORED, healthcheck_path="")
+
+        self.assertNotIn("updated", result)
+        self.assertFalse(result["verified"])
+        self.assertIsNone(result["sent"])
+        self.assertEqual("/healthz", result["observed"])
+        self.assertIn("/healthz", result["error"])
+        self.assertIn("dashboard", result["error"])
+        self.assertIn("svc1", result["error"])
+        self.assertIn("e1", result["error"])
+
+    async def test_a_dropped_clear_says_the_timeout_was_not_read_back(self):
+        """The refusal's generic sentence ends "Nothing was changed", which is
+        true of the path and unknown of a timeout sent in the same write — the
+        check reads one field. Saying so is the difference between an honest
+        refusal and a new small lie in place of the old one."""
+        with_timeout, _ = await self._set(self._STORED, healthcheck_path="",
+                                          healthcheck_timeout=120)
+        self.assertIn("healthcheck_timeout", with_timeout["error"])
+
+        alone, _ = await self._set(self._STORED, healthcheck_path="")
+        self.assertNotIn("healthcheck_timeout", alone["error"],
+                         "a caveat about a field the caller never sent is noise")
+
+    async def test_a_dropped_clear_is_verified_before_any_redeploy(self):
+        routes = {**self._STORED,
+                  "serviceInstanceRedeploy": {"serviceInstanceRedeploy": True}}
+        result, session = await self._set(routes, healthcheck_path="",
+                                          redeploy=True)
+
+        self.assertFalse(result["verified"])
+        self.assertEqual([], [c for c in session.calls
+                              if "serviceInstanceRedeploy" in c["query"]])
+
+    async def test_the_check_reads_back_after_the_write_not_before(self):
+        """The guard read the tool already makes would satisfy a check placed
+        before the write while proving nothing."""
+        _, session = await self._set(self._STORED, healthcheck_path="")
+
+        kinds = ["write" if "serviceInstanceUpdate" in c["query"] else "read"
+                 for c in session.calls]
+        self.assertEqual(["read", "write", "read"], kinds)
+
+    async def test_railway_refusing_the_check_is_not_reported_as_success(self):
+        """Write sent, read-back failed: nobody knows whether it landed, and
+        that is not success."""
+        routes = {**self._STORED, "serviceInstance(serviceId": [
+            {"serviceInstance": {"serviceId": "svc1", "serviceName": "web"}},
+            {"errors": [{"message": "Not Authorized"}]},
+        ]}
+        result, session = await self._set(routes, healthcheck_path="/healthz")
+
+        self.assertNotIn("updated", result)
+        self.assertFalse(result["verified"])
+        self.assertIn("would not confirm", result["error"])
+        self.assertIn("Not Authorized", result["error"])
+        self.assertEqual(1, len([c for c in session.calls
+                                 if "serviceInstanceUpdate" in c["query"]]))
+
+    async def test_clearing_a_service_that_has_no_healthcheck_is_a_success(self):
+        """The check is on the END STATE, not on movement: asked to remove a
+        path that is not there, the tool reports the state the caller wanted
+        rather than accusing Railway of dropping a write with nothing to do."""
+        empty = {**self._STORED, "serviceInstance(serviceId": {
+            "serviceInstance": {"serviceId": "svc1", "serviceName": "web"}}}
+        result, _ = await self._set(empty, healthcheck_path="")
+
+        self.assertTrue(result["updated"])
+        self.assertTrue(result["verified"])
+        self.assertIsNone(result["healthcheckPath"])
 
 
 class MissingServiceInstanceTest(_StubbedServer):
@@ -2814,13 +3021,16 @@ class MissingServiceInstanceTest(_StubbedServer):
     async def test_an_existing_instance_is_still_written(self):
         """The guard must refuse the missing case only — the working path is
         the whole point of the tools."""
-        # `region` is here because set_region now reads the field back and
-        # refuses when it did not land — so "the working path" for that one
-        # tool means a Railway that stores what it is told, not merely one
-        # that has an instance. It matches the region _call writes.
+        # `region`, `buildCommand` and `healthcheckPath` are here because those
+        # three tools now read their field back and refuse when it did not
+        # land — so "the working path" for them means a Railway that stores
+        # what it is told, not merely one that has an instance. Each value
+        # matches what the corresponding _call writes.
         present = {**self._WRITE, "serviceInstance(serviceId": {
             "serviceInstance": {"serviceId": "svc-pdf", "serviceName": "pdf",
-                                "region": "europe-west4-drams3a"}}}
+                                "region": "europe-west4-drams3a",
+                                "buildCommand": "npm run build",
+                                "healthcheckPath": "/healthz"}}}
 
         for tool in ("set_service_config", "set_start_command", "set_region",
                      "set_build_command", "set_dockerfile_path",
