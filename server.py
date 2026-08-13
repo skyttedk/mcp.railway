@@ -1647,17 +1647,119 @@ async def check_variable(project_id: str, environment_id: str,
         "sha256_16": hashlib.sha256(v.encode()).hexdigest()[:16],
     })
 
+async def _variable_names(project_id: str, environment_id: str,
+                          service_id: str) -> set[str]:
+    """The keys currently in one variable collection, values discarded here.
+
+    The same `variables` query list_variables and check_variable read, kept to
+    the same rule: a value is never returned to the caller and never logged.
+    """
+    data = await _query("""query($pid: String!, $eid: String!, $sid: String!) {
+      variables(projectId: $pid, environmentId: $eid, serviceId: $sid)
+    }""", {"pid": project_id, "eid": environment_id, "sid": service_id})
+    return set(data.get("variables") or {})
+
+
+# `variableCollectionUpsert` writes a whole COLLECTION, and its `replace` field
+# decides whether the dict handed over is merged into the stored one or becomes
+# it. The field used not to be sent at all, so the outcome rested entirely on
+# Railway's default — invisible from here, and the difference between setting
+# one variable and deleting every secret on the service. A project's deploy
+# routine that nudges a rebuild by writing a dummy `DEPLOY_NUDGE` is one
+# `replace` default away from wiping the service it is nudging.
+#
+# Introspection settles what that default is (Railway answers introspection
+# without a token, which is how the region and environment notes above were
+# established too): on `VariableCollectionUpsertInput`, `replace` is a nullable
+# Boolean whose `defaultValue` is `"false"`, described as "When set to true,
+# removes all existing variables before upserting the new collection". The old
+# silence was therefore a merge — the safe half — but silence is not the same
+# as a decision, so the field is now sent explicitly in BOTH states: a
+# server-side default is the vendor's to change, and this one turns a write
+# into a wipe.
 @mcp.tool()
 async def set_variables(project_id: str, environment_id: str,
-                  service_id: str, variables: dict[str, str]) -> str:
-    """Set variables on a Railway service."""
+                  service_id: str, variables: dict[str, str],
+                  replace: bool = False) -> str:
+    """Add or update variables on a Railway service, keeping the rest.
+
+    `variables` addresses the service's WHOLE variable collection, not only the
+    keys named in it, so what happens to the keys left out is this tool's most
+    important behaviour. With `replace=False` (the default) they are kept and
+    the given keys are merged in, so passing one key sets one key. With
+    `replace=True` the given dict BECOMES the collection and every key not
+    listed is deleted — credentials included, with no undo and no copy kept by
+    Railway. Ask for that by name only when wiping the collection is the point.
+
+    Values are never returned. The answer is names only: `keysSet` (what was
+    sent), `keysNow` (the whole collection read back afterwards) and
+    `keysRemoved` (present before the write, gone after — empty for a merge).
+    For lengths and truncated hashes per key, use list_variables, or
+    check_variable for one key; neither moves a value either.
+
+    The collection is read before and after the write, so a key that failed to
+    land, and a Railway that will not answer, are reported as themselves rather
+    than as a success nobody checked.
+    """
+    try:
+        before = await _variable_names(project_id, environment_id, service_id)
+    except RuntimeError as exc:
+        return json.dumps({
+            "error": f"Railway would not list the variables already on service "
+                     f"{service_id} in environment {environment_id}: {exc}. "
+                     "Nothing was changed — set_variables reads the collection "
+                     "first, because the write addresses all of it and a "
+                     "replace deletes whatever it could not see.",
+            "verified": False})
+
     result = await _query("""mutation($input: VariableCollectionUpsertInput!) {
       variableCollectionUpsert(input: $input)
     }""", {"input": {
         "projectId": project_id, "environmentId": environment_id,
-        "serviceId": service_id, "variables": variables
+        "serviceId": service_id, "variables": variables,
+        "replace": replace,
     }})
-    return json.dumps(result)
+    if result.get("variableCollectionUpsert") is False:
+        return json.dumps({
+            "error": f"Railway rejected the variable write for service "
+                     f"{service_id} in environment {environment_id} "
+                     "(variableCollectionUpsert returned false). Nothing was "
+                     "changed.",
+            "keysSet": sorted(variables), "verified": False})
+
+    try:
+        after = await _variable_names(project_id, environment_id, service_id)
+    except RuntimeError as exc:
+        return json.dumps({
+            "error": f"set_variables sent {len(variables)} variable(s) to "
+                     f"service {service_id} in environment {environment_id} "
+                     f"with replace={replace}, but Railway would not read the "
+                     f"collection back afterwards: {exc}. The write may or may "
+                     "not have landed — list the keys with list_variables "
+                     "before assuming either.",
+            "keysSet": sorted(variables), "verified": False})
+
+    missing = sorted(set(variables) - after)
+    if missing:
+        return json.dumps({
+            "error": f"set_variables was accepted by Railway and then silently "
+                     f"dropped: it set {sorted(variables)} on service "
+                     f"{service_id} in environment {environment_id}, Railway's "
+                     "mutation answered success, but reading the collection "
+                     f"back immediately does not report {missing}. Treat the "
+                     "whole write as unlanded and check the collection in the "
+                     "Railway dashboard.",
+            "keysSet": sorted(variables), "keysMissing": missing,
+            "keysNow": sorted(after), "verified": False})
+
+    return json.dumps({
+        "updated": True,
+        "replace": replace,
+        "keysSet": sorted(variables),
+        "keysNow": sorted(after),
+        "keysRemoved": sorted(before - after),
+        "verified": True,
+    })
 
 # Statuses of a deployment that has been RELEASED and still holds the service's
 # container — i.e. the one a request to the service reaches right now. Anything

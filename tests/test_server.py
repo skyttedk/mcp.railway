@@ -2909,6 +2909,143 @@ class HealthcheckClearTest(_StubbedServer):
         self.assertIsNone(result["healthcheckPath"])
 
 
+class SetVariablesMergeTest(_StubbedServer):
+    """`set_variables` writes a COLLECTION, so what happens to the keys it was
+    not given is the behaviour that matters (2026-08-13).
+
+    The tool passed the caller's dict straight into `variableCollectionUpsert`
+    and never sent the input's `replace` field, so whether one key was set or
+    every secret on the service was deleted rested on Railway's default — with
+    a one-line docstring that mentioned neither outcome. Introspection settles
+    the default (`VariableCollectionUpsertInput.replace` is a Boolean with
+    `defaultValue` "false", "When set to true, removes all existing variables
+    before upserting the new collection"), and the field is now sent explicitly
+    in both states so no vendor default decides it. The rest is the same rule
+    the other write paths follow: read back and report names, never values.
+    """
+
+    _BEFORE = {"KEEP": "x", "OLD": "y"}
+
+    def _routes(self, before: dict, after: dict) -> dict:
+        return {"variables(projectId": [{"variables": before},
+                                        {"variables": after}],
+                "variableCollectionUpsert": {"variableCollectionUpsert": True}}
+
+    async def _set(self, routes: dict, **args) -> tuple[dict, _FakeSession]:
+        session = self.install(routes)
+        call = {"project_id": "p1", "environment_id": "e1",
+                "service_id": "svc1", "variables": {"NEW": "1"}, **args}
+        result = json.loads(await _text(server.mcp.call_tool("set_variables", call)))
+        return result, session
+
+    @staticmethod
+    def _sent(session: _FakeSession) -> dict:
+        return next(c["variables"]["input"] for c in session.calls
+                    if "variableCollectionUpsert" in c["query"])
+
+    async def test_replace_is_sent_explicitly_and_defaults_to_merge(self):
+        """The defect itself: the field absent means Railway's default decides,
+        and a default that flips turns a nudge variable into a wipe."""
+        _, session = await self._set(
+            self._routes(self._BEFORE, {**self._BEFORE, "NEW": "1"}))
+
+        sent = self._sent(session)
+        self.assertIn("replace", sent,
+                      "the mutation input omits `replace`, so the outcome is "
+                      "Railway's default rather than the caller's choice")
+        self.assertIs(False, sent["replace"])
+
+    async def test_replace_true_is_passed_through(self):
+        _, session = await self._set(self._routes(self._BEFORE, {"NEW": "1"}),
+                                     replace=True)
+
+        self.assertIs(True, self._sent(session)["replace"])
+
+    async def test_a_merge_reports_the_keys_and_removes_nothing(self):
+        result, _ = await self._set(
+            self._routes(self._BEFORE, {**self._BEFORE, "NEW": "1"}))
+
+        self.assertTrue(result["updated"])
+        self.assertTrue(result["verified"])
+        self.assertIs(False, result["replace"])
+        self.assertEqual(["NEW"], result["keysSet"])
+        self.assertEqual(["KEEP", "NEW", "OLD"], result["keysNow"])
+        self.assertEqual([], result["keysRemoved"])
+
+    async def test_a_replace_names_the_keys_it_deleted(self):
+        """The whole point of returning the key set: what a replace took away
+        is visible in the answer instead of being found weeks later."""
+        result, _ = await self._set(self._routes(self._BEFORE, {"NEW": "1"}),
+                                    replace=True)
+
+        self.assertEqual(["NEW"], result["keysNow"])
+        self.assertEqual(["KEEP", "OLD"], result["keysRemoved"])
+
+    async def test_no_value_ever_reaches_the_answer(self):
+        """Same rule as list_variables and check_variable — the read-back holds
+        every value on the service, so the tool must hand back names alone."""
+        result, _ = await self._set(
+            self._routes({"TOKEN": "s3cret"}, {"TOKEN": "s3cret", "NEW": "1"}))
+
+        self.assertNotIn("s3cret", json.dumps(result))
+        self.assertNotIn("1", json.dumps(result["keysNow"]))
+
+    async def test_a_key_that_did_not_land_is_an_error_not_a_success(self):
+        result, _ = await self._set(self._routes(self._BEFORE, self._BEFORE))
+
+        self.assertNotIn("updated", result)
+        self.assertFalse(result["verified"])
+        self.assertEqual(["NEW"], result["keysMissing"])
+        self.assertIn("silently dropped", result["error"])
+
+    async def test_railway_refusing_the_read_back_leaves_the_landing_unknown(self):
+        """Write sent, collection unreadable: the honest answer is that nobody
+        knows whether it landed, not that it did."""
+        routes = {**self._routes(self._BEFORE, {}),
+                  "variables(projectId": [{"variables": self._BEFORE},
+                                          {"errors": [{"message": "Not Authorized"}]}]}
+        result, session = await self._set(routes)
+
+        self.assertNotIn("updated", result)
+        self.assertFalse(result["verified"])
+        self.assertIn("may or may not have landed", result["error"])
+        self.assertIn("Not Authorized", result["error"])
+        self.assertEqual(["NEW"], result["keysSet"])
+        self.assertEqual(1, len([c for c in session.calls
+                                 if "variableCollectionUpsert" in c["query"]]))
+
+    async def test_a_collection_that_cannot_be_read_first_is_not_written(self):
+        """A replace deletes whatever it could not see, so the before-read is a
+        guard and not only a diff — same doctrine as _instance_missing."""
+        routes = {**self._routes(self._BEFORE, {}),
+                  "variables(projectId": {"errors": [{"message": "Not Authorized"}]}}
+        result, session = await self._set(routes, replace=True)
+
+        self.assertFalse(result["verified"])
+        self.assertIn("Nothing was changed", result["error"])
+        self.assertEqual([], [c for c in session.calls
+                              if "variableCollectionUpsert" in c["query"]])
+
+    async def test_the_collection_is_read_before_and_after_the_write(self):
+        _, session = await self._set(
+            self._routes(self._BEFORE, {**self._BEFORE, "NEW": "1"}))
+
+        kinds = ["write" if "variableCollectionUpsert" in c["query"] else "read"
+                 for c in session.calls]
+        self.assertEqual(["read", "write", "read"], kinds)
+
+    def test_the_docstring_states_the_merge_replace_distinction(self):
+        """A caller reads the description, not the mutation. The one-line
+        docstring is what made the destructive reading possible at all."""
+        doc = next(t.description for t in server.mcp._tool_manager.list_tools()
+                   if t.name == "set_variables")
+
+        self.assertIn("merged", doc)
+        self.assertIn("deleted", doc)
+        self.assertIn("replace=True", doc)
+        self.assertIn("default", doc)
+
+
 class MissingServiceInstanceTest(_StubbedServer):
     """Regression: config writes reported success for an instance that was not
     there.
