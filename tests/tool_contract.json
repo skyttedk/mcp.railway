@@ -47,6 +47,17 @@
       "service_id": "string"
     }
   },
+  "create_environment": {
+    "required": [
+      "name"
+    ],
+    "args": {
+      "ephemeral": "boolean",
+      "name": "string",
+      "project_id": "string",
+      "source_environment_id": "string"
+    }
+  },
   "create_project": {
     "required": [
       "name"
@@ -98,6 +109,15 @@
       "project_id": "string",
       "region": "string",
       "service_id": "string"
+    }
+  },
+  "delete_environment": {
+    "required": [
+      "environment_id"
+    ],
+    "args": {
+      "confirm_permanent_delete": "boolean",
+      "environment_id": "string"
     }
   },
   "delete_service": {
@@ -391,6 +411,19 @@
       "service_id"
     ],
     "args": {
+      "environment_id": "string",
+      "project_id": "string",
+      "service_id": "string"
+    }
+  },
+  "update_deployment_trigger": {
+    "required": [
+      "branch",
+      "environment_id",
+      "service_id"
+    ],
+    "args": {
+      "branch": "string",
       "environment_id": "string",
       "project_id": "string",
       "service_id": "string"

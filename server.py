@@ -1276,6 +1276,265 @@ async def list_environments(project_id: str) -> str:
     envs = [e["node"] for e in data["project"]["environments"]["edges"]]
     return json.dumps(envs)
 
+# ── environment lifecycle ────────────────────────────────────────────
+#
+# An ephemeral preview environment is created and destroyed by a script, with
+# no human between the request and the mutation — so environmentDelete is the
+# second irreversible operation in this server, next to serviceDelete, and it
+# takes MORE with it: every service instance in the environment, its variables,
+# its deployments and its volumes' data. Railway's own mutation is a bare
+# `environmentDelete(id:)` that asks nothing and confirms nothing.
+#
+# Hence two layers before it fires. The environment is read back first, so an
+# id Railway will not confirm deletes nothing (same guard as delete_service).
+# Then the name is judged: an environment whose name carries a throwaway prefix
+# — or that Railway itself marks isEphemeral — is what this tool exists for and
+# goes without ceremony, while anything else needs confirm_permanent_delete
+# spelled out. `production` and `test`, and whichever environment the project
+# names as its base or primary one, are refused whatever the flag says: those
+# are the environments a preview script has no business touching, and a flag
+# that can unlock them is a flag that will be passed by a retry loop.
+_EPHEMERAL_PREFIXES = ("pr-", "preview-", "ephemeral-")
+
+# Names that are never deletable through this tool, regardless of arguments.
+# Compared case-insensitively against the environment's own name.
+_PROTECTED_ENVIRONMENT_NAMES = ("production", "test")
+
+
+@mcp.tool()
+async def create_environment(name: str, project_id: str = "",
+                             source_environment_id: str = "",
+                             ephemeral: bool = False) -> str:
+    """Create a Railway environment, optionally as a copy of an existing one.
+
+    With source_environment_id (an id from list_environments) Railway DUPLICATES
+    that environment: its services, their configuration and their variables are
+    copied into the new one. Without it the environment starts empty. This is
+    the create half of an ephemeral-preview workflow — one environment per pull
+    request or per card, deleted again with delete_environment.
+
+    `ephemeral` marks the environment as throwaway in Railway's own model
+    (readable as isEphemeral, and how Railway's PR environments are tagged). It
+    changes nothing about how services run; it is a label, and delete_environment
+    reads it.
+
+    Creation is ASYNCHRONOUS on Railway's side: this returns as soon as the
+    environment exists, which is BEFORE the copied services and their
+    deployments necessarily do. Poll list_services (with the new environment's
+    id) or list_environments until what you need is there — do not assume the
+    clone is complete because this call succeeded.
+
+    project_id may be omitted only if this server pins a default project."""
+    pid = _pid(project_id)
+    if not pid:
+        return _no_project(f"Creating the environment {name!r}",
+                           extra="Nothing was created.")
+    if not name.strip():
+        return json.dumps({"error": "An environment needs a name: pass a "
+                                    "non-empty `name`. Nothing was created."})
+
+    payload: dict = {"projectId": pid, "name": name}
+    if source_environment_id:
+        payload["sourceEnvironmentId"] = source_environment_id
+    if ephemeral:
+        payload["ephemeral"] = True
+
+    data = await _query("""mutation($input: EnvironmentCreateInput!) {
+      environmentCreate(input: $input) {
+        id
+        name
+        projectId
+        isEphemeral
+        createdAt
+      }
+    }""", {"input": payload})
+    created = data["environmentCreate"]
+    return json.dumps({
+        **created,
+        "clonedFrom": source_environment_id or None,
+        "note": "The environment exists. Railway copies services and starts "
+                "their deployments in the background, so it may still be empty "
+                "for a while — confirm with list_services / list_environments "
+                "rather than assuming the clone finished."
+        if source_environment_id else
+        "The environment exists and is empty — it has no services until one is "
+        "created in it.",
+    })
+
+
+@mcp.tool()
+async def delete_environment(environment_id: str,
+                             confirm_permanent_delete: bool = False) -> str:
+    """PERMANENTLY DELETE one Railway environment. Irreversible — no undo, and
+    nothing is moved to a trash first.
+
+    What goes with it: every service instance in that environment, all of their
+    VARIABLES, all of their deployments and logs, and every VOLUME attached to a
+    service in it together with the data on it. Services themselves survive in
+    the project's other environments; anything that existed only here does not.
+
+    Intended for the ephemeral environments create_environment makes. An
+    environment whose name starts with pr-, preview- or ephemeral-, or that
+    Railway marks isEphemeral, is deleted directly. Any OTHER environment is
+    refused unless confirm_permanent_delete=True is passed as well — deleting a
+    long-lived environment is a decision, not a cleanup step.
+
+    `production` and `test`, and whichever environment the project names as its
+    base or primary one, are REFUSED in every case, confirm_permanent_delete
+    included. The environment is looked up before the delete fires, so an id
+    Railway cannot confirm deletes nothing."""
+    if not environment_id:
+        return json.dumps({"error": "Name the environment to delete: pass "
+                                    "environment_id (from list_environments). "
+                                    "delete_environment never chooses one for you."})
+
+    try:
+        data = await _query("""query($id: String!) {
+          environment(id: $id) { id name projectId isEphemeral }
+        }""", {"id": environment_id})
+    except RuntimeError as exc:
+        return json.dumps({
+            "error": f"Railway would not confirm environment {environment_id}: "
+                     f"{exc}. Nothing was deleted — delete_environment looks the "
+                     "environment up first and will not fire at an id it could "
+                     "not read back."})
+    target = data.get("environment")
+    if not target:
+        return json.dumps({
+            "error": f"No environment with id {environment_id}. Nothing was deleted."})
+
+    env_name = (target.get("name") or "").strip()
+    if env_name.lower() in _PROTECTED_ENVIRONMENT_NAMES:
+        return json.dumps({
+            "error": f"Refusing to delete the environment named {env_name!r} "
+                     f"({environment_id}). Nothing was deleted. "
+                     f"{', '.join(_PROTECTED_ENVIRONMENT_NAMES)} are protected "
+                     "here whatever confirm_permanent_delete says — delete such "
+                     "an environment in the Railway dashboard, where a human "
+                     "sees the request."})
+
+    # The project's own idea of its default environment, which is not always
+    # called "production". A refused or unreadable project lookup must not
+    # unlock the delete, so it is treated as "cannot rule this out".
+    try:
+        project = await _query("""query($id: String!) {
+          project(id: $id) { id name baseEnvironmentId primaryEnvironmentId }
+        }""", {"id": target.get("projectId") or ""})
+        proj = project.get("project") or {}
+    except RuntimeError as exc:
+        return json.dumps({
+            "error": f"Railway would not confirm the project environment "
+                     f"{environment_id} belongs to: {exc}. Nothing was deleted — "
+                     "without the project this cannot tell a throwaway "
+                     "environment from the project's default one."})
+    defaults = {proj.get("baseEnvironmentId"), proj.get("primaryEnvironmentId")}
+    if environment_id in defaults:
+        return json.dumps({
+            "error": f"Environment {env_name!r} ({environment_id}) is the default "
+                     f"environment of project {proj.get('name') or proj.get('id')}. "
+                     "Nothing was deleted — the project's own environment is "
+                     "protected here whatever confirm_permanent_delete says."})
+
+    looks_ephemeral = (bool(target.get("isEphemeral"))
+                       or env_name.lower().startswith(_EPHEMERAL_PREFIXES))
+    if not looks_ephemeral and not confirm_permanent_delete:
+        return json.dumps({
+            "error": f"Environment {env_name!r} ({environment_id}) does not look "
+                     "like a throwaway one: its name starts with none of "
+                     f"{', '.join(_EPHEMERAL_PREFIXES)} and Railway does not mark "
+                     "it ephemeral. Nothing was deleted. If deleting it really is "
+                     "intended — with all of its variables, deployments and "
+                     "volume data — call again with "
+                     "confirm_permanent_delete=true.",
+            "environmentName": env_name,
+            "isEphemeral": bool(target.get("isEphemeral"))})
+
+    result = await _query("""mutation($id: String!) {
+      environmentDelete(id: $id)
+    }""", {"id": environment_id})
+    return json.dumps({
+        "environmentId": environment_id,
+        "environmentName": env_name,
+        "projectId": target.get("projectId"),
+        "deleted": result.get("environmentDelete"),
+        "note": f"Environment {env_name} ({environment_id}) was permanently "
+                "deleted, with the service instances in it, their variables, "
+                "deployments and volume data. This cannot be undone."})
+
+
+@mcp.tool()
+async def update_deployment_trigger(environment_id: str, service_id: str,
+                                    branch: str, project_id: str = "") -> str:
+    """Point a service's auto-deploy trigger at a different GIT BRANCH, in ONE
+    environment.
+
+    This is what makes a cloned environment build something other than what it
+    was cloned from: the copy inherits the source environment's branch, and this
+    repoints it. A deployment trigger belongs to one service in one environment,
+    so this changes nothing for that service anywhere else.
+
+    It rewrites configuration only — no build is started here. Use
+    create_deployment to deploy the new branch now; otherwise the next push to
+    it is what deploys.
+
+    The trigger is resolved from service_id + environment_id first. If the
+    service has no trigger there (a service deployed from an image, or one never
+    connected to a repo) or somehow more than one, this REFUSES and changes
+    nothing rather than guessing; creating a trigger where none exists is a
+    different operation and is deliberately not exposed here.
+
+    project_id may be omitted only if this server pins a default project."""
+    pid = _pid(project_id)
+    if not pid:
+        return _no_project("Finding the deployment trigger to update",
+                           extra="Nothing was changed.")
+    if not branch.strip():
+        return json.dumps({"error": "Pass the branch to deploy from — "
+                                    "update_deployment_trigger writes `branch` "
+                                    "and an empty one means nothing. Nothing "
+                                    "was changed."})
+
+    data = await _query("""query($pid: String!, $eid: String!, $sid: String!) {
+      deploymentTriggers(projectId: $pid, environmentId: $eid, serviceId: $sid) {
+        edges { node { id branch repository serviceId environmentId } }
+      }
+    }""", {"pid": pid, "eid": environment_id, "sid": service_id})
+    triggers = [e["node"] for e in
+                (data.get("deploymentTriggers") or {}).get("edges", [])]
+
+    if not triggers:
+        return json.dumps({
+            "error": f"Service {service_id} has no deployment trigger in "
+                     f"environment {environment_id}, so there is no branch to "
+                     "change. Nothing was changed — this happens when the "
+                     "service deploys from a Docker image, or was never "
+                     "connected to a GitHub repo (connect_service does that).",
+            "projectId": pid})
+    if len(triggers) > 1:
+        return json.dumps({
+            "error": f"Service {service_id} has {len(triggers)} deployment "
+                     f"triggers in environment {environment_id}, so this does "
+                     "not identify one. Nothing was changed.",
+            "triggers": triggers})
+
+    trigger = triggers[0]
+    updated = await _query("""mutation($id: String!, $input: DeploymentTriggerUpdateInput!) {
+      deploymentTriggerUpdate(id: $id, input: $input) {
+        id
+        branch
+        repository
+        serviceId
+        environmentId
+      }
+    }""", {"id": trigger["id"], "input": {"branch": branch}})
+    return json.dumps({
+        "trigger": updated["deploymentTriggerUpdate"],
+        "previousBranch": trigger.get("branch"),
+        "note": "Configuration only — nothing was deployed. Use "
+                "create_deployment to build this branch now, or let the next "
+                "push to it deploy."})
+
+
 @mcp.tool()
 async def list_variables(project_id: str, environment_id: str, service_id: str = "") -> str:
     """List which variables are set on a project/environment/service.
